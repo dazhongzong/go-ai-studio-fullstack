@@ -1,0 +1,22 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: go_ai_studio
+    ports:
+      - "3306:3306"
+    volumes:
+      - go_ai_mysql:/var/lib/mysql
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - go_ai_rabbitmq:/var/lib/rabbitmq
+
+volumes:
+  go_ai_mysql:
+  go_ai_rabbitmq:
