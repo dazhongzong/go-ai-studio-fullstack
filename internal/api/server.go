@@ -28,6 +28,7 @@ import (
 type askRequest struct {
 	Prompt         string        `json:"prompt"`
 	ConversationID string        `json:"conversation_id"`
+	ClientID       string        `json:"-"`
 	Messages       []chatMessage `json:"messages"` // backward-compatible client context
 	DelayMS        int           `json:"delay_ms"` // simulated inference duration
 }
@@ -177,6 +178,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 	if opts.AccessLog {
 		router.Use(logRequests())
 	}
+	protect := requireAPIKey(opts.APIKey)
 
 	router.NoMethod(func(c *gin.Context) {
 		c.Header("Allow", "GET, POST")
@@ -210,12 +212,53 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			return err
 		})
 	})
-	protect := requireAPIKey(opts.APIKey)
+	router.GET("/conversations", protect, func(c *gin.Context) {
+		if opts.Store == nil {
+			c.JSON(http.StatusNotImplemented, errorResponse{Error: "conversation store is disabled", RequestID: requestID(c.Request)})
+			return
+		}
+		ownerID, err := requireClientID(c.Request)
+		if err != nil {
+			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, time.Now(), 0, err)
+			return
+		}
+		conversations, err := opts.Store.ListConversations(c.Request.Context(), ownerID, 50)
+		if err != nil {
+			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, time.Now(), 0, err)
+			return
+		}
+		c.JSON(http.StatusOK, conversations)
+	})
+	router.DELETE("/conversations/:id", protect, func(c *gin.Context) {
+		if opts.Store == nil {
+			c.JSON(http.StatusNotImplemented, errorResponse{Error: "conversation store is disabled", RequestID: requestID(c.Request)})
+			return
+		}
+		ownerID, err := requireClientID(c.Request)
+		if err != nil {
+			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, time.Now(), 0, err)
+			return
+		}
+		if err := opts.Store.DeleteConversation(c.Request.Context(), ownerID, c.Param("id")); err != nil {
+			if errors.Is(err, store.ErrConversationNotFound) {
+				writeRequestError(c.Writer, http.StatusNotFound, c.Request, time.Now(), 0, err)
+				return
+			}
+			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, time.Now(), 0, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
 	router.POST("/ask", protect, limitAsk(opts.MaxInFlight), func(c *gin.Context) {
 		started := time.Now()
 		input, err := decodeAskInput(c.Writer, c.Request)
 		if err != nil {
 			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, started, 0, err)
+			return
+		}
+		input.ClientID, err = optionalClientID(c.Request, opts.Store != nil)
+		if err != nil {
+			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, time.Now(), 0, err)
 			return
 		}
 		prepared, err := prepareRequestPrompt(c.Request.Context(), input, opts)
@@ -245,7 +288,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			writeTaskError(c.Writer, c.Request, started, 0, err)
 			return
 		}
-		if err := saveUserMessage(c.Request.Context(), opts.Store, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
+		if err := saveUserMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
 			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, 0, err)
 			return
 		}
@@ -255,7 +298,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 				writeTaskError(c.Writer, c.Request, started, result.QueueWait, result.Err)
 				return
 			}
-			if err := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.conversationID, result.Output, requestID(c.Request), opts.Model); err != nil {
+			if err := saveAssistantMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model); err != nil {
 				writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, result.QueueWait, err)
 				return
 			}
@@ -305,6 +348,21 @@ func readinessHandler(check func(context.Context) error) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, map[string]string{"status": "ready"})
 	}
+}
+
+func requireClientID(r *http.Request) (string, error) {
+	return optionalClientID(r, true)
+}
+
+func optionalClientID(r *http.Request, required bool) (string, error) {
+	value := strings.TrimSpace(r.Header.Get("X-Client-ID"))
+	if value == "" && required {
+		return "", errors.New("X-Client-ID header is required when MySQL persistence is enabled")
+	}
+	if len(value) > 64 {
+		return "", errors.New("X-Client-ID is too long")
+	}
+	return value, nil
 }
 
 // Limit only inference endpoints; health checks and stats remain accessible.
@@ -404,6 +462,7 @@ type preparedRequest struct {
 	prompt         string
 	conversationID string
 	userPrompt     string
+	clientID       string
 }
 
 type persistenceError struct{ err error }
@@ -415,7 +474,7 @@ func prepareRequestPrompt(ctx context.Context, input askRequest, opts Options) (
 	conversationID := strings.TrimSpace(input.ConversationID)
 	if opts.Store == nil || conversationID == "" {
 		prompt, err := preparePrompt(input, opts.MaxPromptLength, opts.MaxContextMessages, opts.MaxContextLength)
-		return preparedRequest{prompt: prompt}, err
+		return preparedRequest{prompt: prompt, clientID: input.ClientID}, err
 	}
 	if len(conversationID) > 64 {
 		return preparedRequest{}, errors.New("conversation_id is too long")
@@ -430,7 +489,7 @@ func prepareRequestPrompt(ctx context.Context, input askRequest, opts Options) (
 	if err := validatePrompt(userPrompt, opts.MaxPromptLength); err != nil {
 		return preparedRequest{}, err
 	}
-	history, err := opts.Store.LoadMessages(ctx, conversationID, opts.MaxContextMessages-1)
+	history, err := opts.Store.LoadMessages(ctx, input.ClientID, conversationID, opts.MaxContextMessages-1)
 	if err != nil {
 		return preparedRequest{}, &persistenceError{err: err}
 	}
@@ -443,24 +502,24 @@ func prepareRequestPrompt(ctx context.Context, input askRequest, opts Options) (
 	if err != nil {
 		return preparedRequest{}, err
 	}
-	return preparedRequest{prompt: prompt, conversationID: conversationID, userPrompt: userPrompt}, nil
+	return preparedRequest{prompt: prompt, conversationID: conversationID, userPrompt: userPrompt, clientID: input.ClientID}, nil
 }
 
-func saveUserMessage(ctx context.Context, conversationStore store.ConversationStore, conversationID, content, requestID, model string) error {
+func saveUserMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string) error {
 	if conversationStore == nil || conversationID == "" || content == "" {
 		return nil
 	}
-	if err := conversationStore.EnsureConversation(ctx, conversationID, content); err != nil {
+	if err := conversationStore.EnsureConversation(ctx, ownerID, conversationID, content); err != nil {
 		return err
 	}
-	return conversationStore.SaveMessage(ctx, conversationID, store.Message{Role: "user", Content: content}, requestID, model)
+	return conversationStore.SaveMessage(ctx, ownerID, conversationID, store.Message{Role: "user", Content: content}, requestID, model)
 }
 
-func saveAssistantMessage(ctx context.Context, conversationStore store.ConversationStore, conversationID, content, requestID, model string) error {
+func saveAssistantMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string) error {
 	if conversationStore == nil || conversationID == "" || content == "" {
 		return nil
 	}
-	return conversationStore.SaveMessage(ctx, conversationID, store.Message{Role: "assistant", Content: content}, requestID, model)
+	return conversationStore.SaveMessage(ctx, ownerID, conversationID, store.Message{Role: "assistant", Content: content}, requestID, model)
 }
 
 func writeRequestError(w http.ResponseWriter, status int, r *http.Request, started time.Time, queueWait time.Duration, err error) {

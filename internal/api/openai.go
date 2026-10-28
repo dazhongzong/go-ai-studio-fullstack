@@ -71,10 +71,16 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 			return
 		}
 
-		prepared, err := prepareRequestPrompt(c.Request.Context(), askRequest{
+		requestInput := askRequest{
 			ConversationID: input.ConversationID,
 			Messages:       input.Messages,
-		}, opts)
+		}
+		requestInput.ClientID, err = optionalClientID(c.Request, opts.Store != nil)
+		if err != nil {
+			writeOpenAIError(c.Writer, http.StatusBadRequest, err)
+			return
+		}
+		prepared, err := prepareRequestPrompt(c.Request.Context(), requestInput, opts)
 		if err != nil {
 			status := http.StatusBadRequest
 			var persistenceErr *persistenceError
@@ -102,7 +108,7 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 			writeOpenAIError(c.Writer, taskErrorStatus(err), err)
 			return
 		}
-		if err := saveUserMessage(c.Request.Context(), opts.Store, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
+		if err := saveUserMessage(c.Request.Context(), opts.Store, requestInput.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
 			writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
 			return
 		}
@@ -113,7 +119,7 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 				writeOpenAIError(c.Writer, taskErrorStatus(result.Err), result.Err)
 				return
 			}
-			if err := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.conversationID, result.Output, requestID(c.Request), opts.Model); err != nil {
+			if err := saveAssistantMessage(c.Request.Context(), opts.Store, requestInput.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model); err != nil {
 				writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
 				return
 			}
@@ -148,7 +154,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 			opts.Metrics.StreamFinished(time.Since(streamStarted), streamFailed)
 		}()
 	}
-	if err := saveUserMessage(c.Request.Context(), opts.Store, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
+	if err := saveUserMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
 		streamFailed = true
 		writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
 		return
@@ -205,7 +211,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 		}
 		if chunk.Done {
 			finished = true
-			if err := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model); err != nil {
+			if err := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model); err != nil {
 				return err
 			}
 			finishReason := "stop"
@@ -217,7 +223,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 		return nil
 	})
 	if err == nil && !finished {
-		if saveErr := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model); saveErr != nil {
+		if saveErr := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model); saveErr != nil {
 			err = saveErr
 		} else {
 			finishReason := "stop"

@@ -40,15 +40,38 @@ export interface AskResult {
   model: string
 }
 
+export interface ConversationSummary {
+  id: string
+  title: string
+  created_at: string
+  updated_at: string
+  message_count: number
+}
+
 export type StreamEvent =
   | { type: 'token'; text: string }
   | { type: 'done'; evalCount?: number; requestId?: string; queueMs?: number; durationMs?: number; model?: string }
   | { type: 'error'; message: string; requestId?: string; durationMs?: number }
 
 const apiKey = (import.meta.env.VITE_API_KEY ?? '').trim()
+const clientIDStorageKey = 'go-ai-studio-client-id'
+
+function getClientID(): string {
+  try {
+    const existing = localStorage.getItem(clientIDStorageKey)?.trim()
+    if (existing) return existing
+    const value = crypto.randomUUID()
+    localStorage.setItem(clientIDStorageKey, value)
+    return value
+  } catch {
+    return `client-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  }
+}
+
+const clientID = getClientID()
 
 function apiHeaders(contentType = false): HeadersInit {
-  const headers: Record<string, string> = {}
+  const headers: Record<string, string> = { 'X-Client-ID': clientID }
   if (contentType) headers['Content-Type'] = 'application/json'
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`
   return headers
@@ -85,6 +108,20 @@ export async function getHealth(): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+export async function listConversations(): Promise<ConversationSummary[]> {
+  const response = await fetch('/api/conversations', { cache: 'no-store', headers: apiHeaders() })
+  await requireOK(response)
+  return (await response.json()) as ConversationSummary[]
+}
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}`, {
+    method: 'DELETE',
+    headers: apiHeaders(),
+  })
+  await requireOK(response)
 }
 
 export async function ask(model: string, conversationId: string, messages: ChatMessage[], signal: AbortSignal): Promise<AskResult> {

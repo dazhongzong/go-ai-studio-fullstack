@@ -232,7 +232,7 @@ func webHandler(apiHandler http.Handler, backend, model, distDir string) http.Ha
 		}{backend, displayModel, backend == "dynamo"})
 	})
 	apiHandlerWithoutPrefix := gin.WrapH(http.StripPrefix("/api", apiHandler))
-	for _, path := range []string{"/ask", "/v1/chat/completions", "/healthz", "/livez", "/readyz", "/stats", "/metrics"} {
+	for _, path := range []string{"/ask", "/v1/chat/completions", "/healthz", "/livez", "/readyz", "/stats", "/metrics", "/conversations", "/conversations/:id"} {
 		router.Any("/api"+path, apiHandlerWithoutPrefix)
 		router.Any(path, gin.WrapH(apiHandler))
 	}

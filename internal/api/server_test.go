@@ -29,16 +29,24 @@ func (testStreamer) Stream(_ context.Context, _ string, onChunk func(llm.Chunk) 
 	return onChunk(llm.Chunk{Done: true})
 }
 
-func (s *memoryConversationStore) EnsureConversation(context.Context, string, string) error {
+func (s *memoryConversationStore) EnsureConversation(context.Context, string, string, string) error {
 	return nil
 }
 
-func (s *memoryConversationStore) LoadMessages(context.Context, string, int) ([]store.Message, error) {
+func (s *memoryConversationStore) LoadMessages(context.Context, string, string, int) ([]store.Message, error) {
 	return append([]store.Message(nil), s.history...), nil
 }
 
-func (s *memoryConversationStore) SaveMessage(_ context.Context, _ string, message store.Message, _, _ string) error {
+func (s *memoryConversationStore) SaveMessage(_ context.Context, _, _ string, message store.Message, _, _ string) error {
 	s.saved = append(s.saved, message)
+	return nil
+}
+
+func (s *memoryConversationStore) ListConversations(context.Context, string, int) ([]store.Conversation, error) {
+	return nil, nil
+}
+
+func (s *memoryConversationStore) DeleteConversation(context.Context, string, string) error {
 	return nil
 }
 
@@ -97,7 +105,9 @@ func TestAskUsesConversationContext(t *testing.T) {
 	h := NewHandlerWithOptions(p, Options{AskTimeout: time.Second})
 	body := `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"continue"}]}`
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(body)))
+	req := httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(body))
+	req.Header.Set("X-Client-ID", "test-client")
+	h.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d response=%s", w.Code, w.Body.String())
 	}
@@ -126,7 +136,9 @@ func TestAskLoadsAndPersistsMySQLConversation(t *testing.T) {
 	h := NewHandlerWithOptions(p, Options{AskTimeout: time.Second, Store: conversationStore})
 	w := httptest.NewRecorder()
 	body := `{"conversation_id":"chat-1","prompt":"continue"}`
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(body)))
+	req := httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(body))
+	req.Header.Set("X-Client-ID", "test-client")
+	h.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d response=%s", w.Code, w.Body.String())
 	}
@@ -137,6 +149,29 @@ func TestAskLoadsAndPersistsMySQLConversation(t *testing.T) {
 	}
 	if len(conversationStore.saved) != 2 || conversationStore.saved[0].Role != "user" || conversationStore.saved[1].Role != "assistant" {
 		t.Fatalf("saved messages=%+v", conversationStore.saved)
+	}
+}
+
+func TestConversationEndpointsRequireClientID(t *testing.T) {
+	p, err := workerpool.New(1, 1, time.Second, SimulatedInference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	h := NewHandlerWithOptions(p, Options{Store: &memoryConversationStore{}})
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/conversations", nil))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "X-Client-ID") {
+		t.Fatalf("status=%d response=%s", w.Code, w.Body.String())
+	}
+
+	withClient := httptest.NewRequest(http.MethodGet, "/conversations", nil)
+	withClient.Header.Set("X-Client-ID", "browser-1")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, withClient)
+	if w.Code != http.StatusOK {
+		t.Fatalf("with client status=%d response=%s", w.Code, w.Body.String())
 	}
 }
 
