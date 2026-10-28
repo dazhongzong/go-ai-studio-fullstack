@@ -23,6 +23,28 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+// Health checks the Dynamo frontend readiness endpoint. Unlike /live, /health
+// also reflects whether the frontend can route to a registered worker.
+func (c *Client) Health(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/health", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("dynamo health request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &llm.HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
+	}
+	return nil
+}
+
 type completionChoice struct {
 	Text         string   `json:"text,omitempty"` // legacy completions compatibility
 	Message      *message `json:"message,omitempty"`

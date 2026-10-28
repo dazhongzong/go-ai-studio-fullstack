@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -45,12 +46,16 @@ func main() {
 	maxPromptLength := envInt("MAX_PROMPT_LENGTH", api.DefaultMaxPromptLength)
 	maxContextMessages := envInt("MAX_CONTEXT_MESSAGES", api.DefaultMaxContextMessages)
 	maxContextLength := envInt("MAX_CONTEXT_LENGTH", api.DefaultMaxContextLength)
+	maxInFlight := envInt("MAX_IN_FLIGHT", 8)
+	poolWorkers := envInt("POOL_WORKERS", 3)
+	poolQueueSize := envInt("POOL_QUEUE_SIZE", 5)
 	handler := workerpool.Handler(api.SimulatedInference)
 	opts := api.Options{
-		MaxInFlight: 8, AskTimeout: 1500 * time.Millisecond,
+		MaxInFlight: maxInFlight, AskTimeout: 1500 * time.Millisecond,
 		StreamTimeout: 2 * time.Minute, AccessLog: true,
 		Model: model, MaxPromptLength: maxPromptLength,
 		MaxContextMessages: maxContextMessages, MaxContextLength: maxContextLength,
+		APIKey: strings.TrimSpace(os.Getenv("API_KEY")),
 	}
 	var conversationStore *store.MySQLStore
 	if dsn := strings.TrimSpace(os.Getenv("MYSQL_DSN")); dsn != "" {
@@ -63,15 +68,16 @@ func main() {
 		opts.Store = conversationStore
 		log.Println("mysql conversation store enabled")
 	}
+	var dynamoClient *dynamo.Client
 	switch backend {
 	case "mock":
 		opts.Model = "mock"
 	case "dynamo":
-		client := dynamo.New(envString("DYNAMO_URL", "http://127.0.0.1:8000"), model)
+		dynamoClient = dynamo.New(envString("DYNAMO_URL", "http://127.0.0.1:8000"), model)
 		handler = func(ctx context.Context, task workerpool.Task) (string, error) {
-			return client.Generate(ctx, task.Prompt)
+			return dynamoClient.Generate(ctx, task.Prompt)
 		}
-		opts.Streamer = client
+		opts.Streamer = dynamoClient
 		opts.AskTimeout = durationEnv("ASK_TIMEOUT", 100*time.Second)
 		opts.StreamTimeout = durationEnv("STREAM_TIMEOUT", 180*time.Second)
 	default:
@@ -90,16 +96,39 @@ func main() {
 		}
 		log.Printf("rabbitmq inference queue enabled: %s", queueURL)
 	}
+	opts.Readiness = func(ctx context.Context) error {
+		if dynamoClient != nil {
+			if err := dynamoClient.Health(ctx); err != nil {
+				return fmt.Errorf("dynamo is not ready: %w", err)
+			}
+		}
+		if queueClient != nil {
+			if err := queueClient.Ready(); err != nil {
+				return fmt.Errorf("rabbitmq is not ready: %w", err)
+			}
+		}
+		if conversationStore != nil {
+			if err := conversationStore.Ping(ctx); err != nil {
+				return fmt.Errorf("mysql is not ready: %w", err)
+			}
+		}
+		return nil
+	}
 	taskTimeout := durationEnv("TASK_TIMEOUT", 700*time.Millisecond)
 	if backend == "dynamo" {
 		taskTimeout = durationEnv("TASK_TIMEOUT", 90*time.Second)
 	}
-	pool, err := workerpool.New(3, 5, taskTimeout, handler)
+	pool, err := workerpool.New(poolWorkers, poolQueueSize, taskTimeout, handler)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer pool.Close()
-	log.Printf("worker pool ready workers=%d queue_capacity=%d task_timeout=%s", 3, 5, taskTimeout)
+	log.Printf("worker pool ready workers=%d queue_capacity=%d task_timeout=%s", poolWorkers, poolQueueSize, taskTimeout)
+	if opts.APIKey == "" {
+		log.Println("api key authentication disabled")
+	} else {
+		log.Println("api key authentication enabled")
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -108,6 +137,7 @@ func main() {
 	server := &http.Server{
 		Addr: ":" + port, Handler: webHandler(api.NewHandlerWithOptions(pool, opts), backend, model, webDist()),
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 		IdleTimeout:       60 * time.Second,
 		// No server-wide WriteTimeout: streams may run for minutes.
 		// StreamTimeout and request Context bound application work.
@@ -199,7 +229,7 @@ func webHandler(apiHandler http.Handler, backend, model, distDir string) http.Ha
 		}{backend, displayModel, backend == "dynamo"})
 	})
 	apiHandlerWithoutPrefix := gin.WrapH(http.StripPrefix("/api", apiHandler))
-	for _, path := range []string{"/ask", "/v1/chat/completions", "/healthz", "/stats"} {
+	for _, path := range []string{"/ask", "/v1/chat/completions", "/healthz", "/livez", "/readyz", "/stats"} {
 		router.Any("/api"+path, apiHandlerWithoutPrefix)
 		router.Any(path, gin.WrapH(apiHandler))
 	}

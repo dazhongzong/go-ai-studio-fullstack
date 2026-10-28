@@ -46,6 +46,14 @@ type Client struct {
 	closeOnce sync.Once
 }
 
+// Ready reports whether the RabbitMQ connection is still usable.
+func (c *Client) Ready() error {
+	if c == nil || c.connection == nil || c.connection.IsClosed() {
+		return ErrClosed
+	}
+	return nil
+}
+
 // NewClient creates a RabbitMQ request/reply client. Multiple API instances
 // can use the same job queue and each instance gets its own private reply
 // queue, so a load balancer does not need sticky sessions for /ask.

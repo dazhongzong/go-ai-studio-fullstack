@@ -45,6 +45,15 @@ export type StreamEvent =
   | { type: 'done'; evalCount?: number; requestId?: string; queueMs?: number; durationMs?: number; model?: string }
   | { type: 'error'; message: string; requestId?: string; durationMs?: number }
 
+const apiKey = (import.meta.env.VITE_API_KEY ?? '').trim()
+
+function apiHeaders(contentType = false): HeadersInit {
+  const headers: Record<string, string> = {}
+  if (contentType) headers['Content-Type'] = 'application/json'
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`
+  return headers
+}
+
 async function requireOK(response: Response): Promise<void> {
   if (response.ok) return
   let message = `HTTP ${response.status}`
@@ -58,20 +67,20 @@ async function requireOK(response: Response): Promise<void> {
 }
 
 export async function getStats(): Promise<PoolStats> {
-  const response = await fetch('/api/stats', { cache: 'no-store' })
+  const response = await fetch('/api/stats', { cache: 'no-store', headers: apiHeaders() })
   await requireOK(response)
   return (await response.json()) as PoolStats
 }
 
 export async function getInfo(): Promise<BackendInfo> {
-  const response = await fetch('/api/info', { cache: 'no-store' })
+  const response = await fetch('/api/info', { cache: 'no-store', headers: apiHeaders() })
   await requireOK(response)
   return (await response.json()) as BackendInfo
 }
 
 export async function getHealth(): Promise<boolean> {
   try {
-    const response = await fetch('/api/healthz', { cache: 'no-store' })
+    const response = await fetch('/api/readyz', { cache: 'no-store', headers: apiHeaders() })
     return response.ok
   } catch {
     return false
@@ -81,7 +90,7 @@ export async function getHealth(): Promise<boolean> {
 export async function ask(conversationId: string, messages: ChatMessage[], signal: AbortSignal): Promise<AskResult> {
 	const response = await fetch('/api/v1/chat/completions', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers: apiHeaders(true),
 		body: JSON.stringify({ conversation_id: conversationId, model: 'Qwen/Qwen3-0.6B', messages, stream: false }),
 		signal,
 	})
@@ -110,7 +119,7 @@ export async function askStream(
 ): Promise<void> {
 	const response = await fetch('/api/v1/chat/completions', {
 		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
+		headers: apiHeaders(true),
 		body: JSON.stringify({ conversation_id: conversationId, model: 'Qwen/Qwen3-0.6B', messages, stream: true }),
 		signal,
   })

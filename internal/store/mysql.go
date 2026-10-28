@@ -50,6 +50,10 @@ func (s *MySQLStore) Close() error {
 	return s.db.Close()
 }
 
+func (s *MySQLStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 func (s *MySQLStore) migrate(ctx context.Context) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS conversations (

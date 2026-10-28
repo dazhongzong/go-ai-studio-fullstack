@@ -38,6 +38,7 @@ internal/store/          MySQL 存储
 workerpool/              Worker Pool
 frontend/                React + TypeScript + Vite
 deploy/nginx.conf        Nginx 负载均衡配置
+deploy/nginx.dev.conf    Nginx 开发环境配置
 docker-compose.yml       MySQL、RabbitMQ
 pyproject.toml           uv/Dynamo 依赖
 ~~~
@@ -55,6 +56,10 @@ BACKEND=dynamo
 PORT=18080
 DYNAMO_URL=http://127.0.0.1:8000
 DYNAMO_MODEL=Qwen/Qwen3-0.6B
+API_KEY=
+MAX_IN_FLIGHT=8
+POOL_WORKERS=3
+POOL_QUEUE_SIZE=5
 
 # 可选：RabbitMQ 非流式任务队列
 QUEUE_URL=amqp://guest:guest@127.0.0.1:5672/
@@ -124,6 +129,8 @@ go run ./cmd/server
 
 默认地址：http://127.0.0.1:18080
 
+如果配置了 API_KEY，前端开发环境还需要在 `frontend/.env.local` 中配置相同的 `VITE_API_KEY`。
+
 启动 React 开发服务：
 
 ~~~bash
@@ -144,6 +151,8 @@ go run ./cmd/server
 ~~~
 
 构建后的页面由 Go 服务从 frontend/dist 提供。
+
+生产环境使用 `deploy/nginx.conf`；本地 Vite 开发环境使用 `deploy/nginx.dev.conf`。
 
 ## RabbitMQ Worker 模式
 
@@ -185,6 +194,8 @@ curl -N http://127.0.0.1:18080/api/v1/chat/completions \
 
 ~~~text
 GET  /api/healthz   健康检查
+GET  /api/livez     进程存活检查
+GET  /api/readyz    依赖就绪检查
 GET  /api/stats     Worker Pool 统计
 POST /api/ask       Worker Pool 学习接口
 ~~~
@@ -197,6 +208,15 @@ go vet ./...
 
 cd frontend
 npm run build
+~~~
+
+也可以使用：
+
+~~~bash
+make test
+make race
+make vet
+make build
 ~~~
 
 日志输出到终端和：

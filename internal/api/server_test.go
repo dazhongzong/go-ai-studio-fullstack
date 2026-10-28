@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,6 +199,52 @@ func TestAskBadJSONAndMethod(t *testing.T) {
 		if w.Code != tc.status {
 			t.Fatalf("want %d got %d", tc.status, w.Code)
 		}
+	}
+}
+
+func TestAPIKeyAuth(t *testing.T) {
+	p, err := workerpool.New(1, 1, time.Second, SimulatedInference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	h := NewHandlerWithOptions(p, Options{APIKey: "test-key", AskTimeout: time.Second})
+
+	withoutKey := httptest.NewRecorder()
+	h.ServeHTTP(withoutKey, httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(`{"prompt":"hello"}`)))
+	if withoutKey.Code != http.StatusUnauthorized {
+		t.Fatalf("without key: want 401, got %d", withoutKey.Code)
+	}
+
+	withKey := httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(`{"prompt":"hello"}`))
+	withKey.Header.Set("Authorization", "Bearer test-key")
+	withKeyResponse := httptest.NewRecorder()
+	h.ServeHTTP(withKeyResponse, withKey)
+	if withKeyResponse.Code != http.StatusOK {
+		t.Fatalf("with key: want 200, got %d: %s", withKeyResponse.Code, withKeyResponse.Body.String())
+	}
+}
+
+func TestReadiness(t *testing.T) {
+	p, err := workerpool.New(1, 1, time.Second, SimulatedInference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	h := NewHandlerWithOptions(p, Options{
+		Readiness: func(context.Context) error { return errors.New("dependency unavailable") },
+	})
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "not_ready") {
+		t.Fatalf("status=%d response=%s", w.Code, w.Body.String())
+	}
+
+	live := httptest.NewRecorder()
+	h.ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/livez", nil))
+	if live.Code != http.StatusOK {
+		t.Fatalf("livez status=%d", live.Code)
 	}
 }
 

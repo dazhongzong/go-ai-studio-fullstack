@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,12 +77,23 @@ func logRequests() gin.HandlerFunc {
 
 func withRequestID(ids *atomic.Uint64) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := fmt.Sprintf("req-%08d", ids.Add(1))
+		id := newRequestID()
+		if id == "" {
+			id = fmt.Sprintf("req-%08d", ids.Add(1))
+		}
 		c.Header("X-Request-ID", id)
 		ctx := context.WithValue(c.Request.Context(), requestIDContextKey{}, id)
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
+}
+
+func newRequestID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return ""
+	}
+	return "req-" + hex.EncodeToString(value[:])
 }
 
 func requestID(r *http.Request) string {
@@ -106,6 +120,8 @@ type Options struct {
 	MaxPromptLength    int
 	MaxContextMessages int
 	MaxContextLength   int
+	APIKey             string
+	Readiness          func(context.Context) error
 	Store              store.ConversationStore
 }
 
@@ -154,10 +170,15 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
+	router.GET("/livez", func(c *gin.Context) {
+		c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+	router.GET("/readyz", readinessHandler(opts.Readiness))
 	router.GET("/stats", func(c *gin.Context) {
 		c.JSON(http.StatusOK, p.Snapshot())
 	})
-	router.POST("/ask", limitAsk(opts.MaxInFlight), func(c *gin.Context) {
+	protect := requireAPIKey(opts.APIKey)
+	router.POST("/ask", protect, limitAsk(opts.MaxInFlight), func(c *gin.Context) {
 		started := time.Now()
 		input, err := decodeAskInput(c.Writer, c.Request)
 		if err != nil {
@@ -214,8 +235,43 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			writeTaskError(c.Writer, c.Request, started, 0, ctx.Err())
 		}
 	})
-	router.POST("/v1/chat/completions", limitAsk(opts.MaxInFlight), openAIChatCompletionsHandler(p, opts, &taskIDs))
+	router.POST("/v1/chat/completions", protect, limitAsk(opts.MaxInFlight), openAIChatCompletionsHandler(p, opts, &taskIDs))
 	return router
+}
+
+func requireAPIKey(expected string) gin.HandlerFunc {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return func(c *gin.Context) { c.Next() }
+	}
+	return func(c *gin.Context) {
+		provided := strings.TrimSpace(c.GetHeader("X-API-Key"))
+		if provided == "" {
+			provided = strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			c.Header("WWW-Authenticate", `Bearer realm="go-ai-studio"`)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, errorResponse{Error: "invalid API key", RequestID: requestID(c.Request)})
+			return
+		}
+		c.Next()
+	}
+}
+
+func readinessHandler(check func(context.Context) error) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if check == nil {
+			c.JSON(http.StatusOK, map[string]string{"status": "ready"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		if err := check(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, map[string]string{"status": "ready"})
+	}
 }
 
 // Limit only inference endpoints; health checks and stats remain accessible.
