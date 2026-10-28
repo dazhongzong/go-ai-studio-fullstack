@@ -87,11 +87,11 @@ export async function getHealth(): Promise<boolean> {
   }
 }
 
-export async function ask(conversationId: string, messages: ChatMessage[], signal: AbortSignal): Promise<AskResult> {
+export async function ask(model: string, conversationId: string, messages: ChatMessage[], signal: AbortSignal): Promise<AskResult> {
 	const response = await fetch('/api/v1/chat/completions', {
 		method: 'POST',
 		headers: apiHeaders(true),
-		body: JSON.stringify({ conversation_id: conversationId, model: 'Qwen/Qwen3-0.6B', messages, stream: false }),
+		body: JSON.stringify({ conversation_id: conversationId, model, messages, stream: false }),
 		signal,
 	})
 	await requireOK(response)
@@ -112,7 +112,8 @@ export async function ask(conversationId: string, messages: ChatMessage[], signa
 // POST + SSE cannot use EventSource; we parse fetch ReadableStream.
 // The buffer handles both UTF-8 splits and SSE frames crossing network chunks.
 export async function askStream(
-  conversationId: string,
+	model: string,
+	conversationId: string,
   messages: ChatMessage[],
   signal: AbortSignal,
   onEvent: (event: StreamEvent) => void,
@@ -120,7 +121,7 @@ export async function askStream(
 	const response = await fetch('/api/v1/chat/completions', {
 		method: 'POST',
 		headers: apiHeaders(true),
-		body: JSON.stringify({ conversation_id: conversationId, model: 'Qwen/Qwen3-0.6B', messages, stream: true }),
+		body: JSON.stringify({ conversation_id: conversationId, model, messages, stream: true }),
 		signal,
   })
   await requireOK(response)

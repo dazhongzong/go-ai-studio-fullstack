@@ -61,6 +61,7 @@ export default function App() {
   const [healthy, setHealthy] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [notice, setNotice] = useState('')
+  const [lastSynced, setLastSynced] = useState<number | null>(null)
   const historyRef = useRef<HTMLDivElement>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -70,8 +71,9 @@ export default function App() {
     [activeID, chats],
   )
   const backendLabel = info?.backend === 'dynamo' ? info.model : 'Mock Backend'
+  const requestModel = info?.model || 'Qwen/Qwen3-0.6B'
   const streamAvailable = info?.streaming === true
-  const canSend = Boolean(prompt.trim()) && !isLoading
+  const canSend = Boolean(prompt.trim()) && !isLoading && healthy
 
   useEffect(() => {
     try {
@@ -88,14 +90,11 @@ export default function App() {
   }, [])
 
   const refreshStatus = useCallback(async () => {
-    const [health, pool] = await Promise.allSettled([getHealth(), getStats()])
+    const [health, pool, backend] = await Promise.allSettled([getHealth(), getStats(), getInfo()])
     setHealthy(health.status === 'fulfilled' ? health.value : false)
     setStats(pool.status === 'fulfilled' ? pool.value : null)
-    try {
-      setInfo(await getInfo())
-    } catch {
-      setInfo(null)
-    }
+    setInfo(backend.status === 'fulfilled' ? backend.value : null)
+    setLastSynced(Date.now())
   }, [])
 
   useEffect(() => {
@@ -192,7 +191,7 @@ export default function App() {
 
     try {
       if (useStreaming && streamAvailable) {
-        await askStream(chatID, context, controller.signal, event => {
+        await askStream(requestModel, chatID, context, controller.signal, event => {
           if (event.type === 'token') {
             answerContent += event.text
             updateMessage(chatID, answer.id, message => ({ ...message, content: answerContent }))
@@ -212,7 +211,7 @@ export default function App() {
           }
         })
       } else {
-        const result = await ask(chatID, context, controller.signal)
+        const result = await ask(requestModel, chatID, context, controller.signal)
         answerContent = result.reply
         updateMessage(chatID, answer.id, message => ({
           ...message,
@@ -352,9 +351,9 @@ export default function App() {
 
             <div className="composer-container">
               <div className="composer">
-                <textarea value={prompt} className="prompt-input" placeholder="输入你想问的问题，例如：Go 的 GMP 调度模型是什么？" rows={2} disabled={isLoading} onChange={event => setPrompt(event.target.value)} onKeyDown={onComposerKeydown} />
+                <textarea value={prompt} className="prompt-input" placeholder={healthy ? '输入你想问的问题，例如：Go 的 GMP 调度模型是什么？' : '等待 Go API 服务就绪…'} rows={2} disabled={isLoading || !healthy} aria-label="输入问题" onChange={event => setPrompt(event.target.value)} onKeyDown={onComposerKeydown} />
                 <div className="composer-toolbar">
-                  <div className="composer-options"><span className="prompt-indicator">⌁</span><span>{backendLabel}</span><span className="toolbar-divider" /><label className="stream-toggle"><input checked={useStreaming} type="checkbox" disabled={!streamAvailable || isLoading} onChange={event => setUseStreaming(event.target.checked)} /><span>流式输出</span></label></div>
+                  <div className="composer-options"><span className="prompt-indicator">⌁</span><span>{backendLabel}</span><span className="toolbar-divider" /><label className="stream-toggle"><input checked={useStreaming} type="checkbox" disabled={!streamAvailable || isLoading || !healthy} onChange={event => setUseStreaming(event.target.checked)} /><span>流式输出</span></label><span className="prompt-count">{prompt.length}</span></div>
                   {isLoading ? <button type="button" className="stop-button" onClick={stopGeneration}>■ <span>停止生成</span></button> : <button type="button" className="send-button" disabled={!canSend} onClick={() => void submit()}>发送消息 <span>↑</span></button>}
                 </div>
               </div>
@@ -363,9 +362,10 @@ export default function App() {
           </section>
 
           <aside className="insights-pane">
-            <div className="insights-header"><span>LIVE MONITORING</span><span className="live-point">● LIVE</span></div>
+            <div className="insights-header"><span>LIVE MONITORING</span><span className={`live-point${healthy ? '' : ' live-point-off'}`}>● {healthy ? 'LIVE' : 'OFFLINE'}</span></div>
             <div className="insights-title">系统运行概况</div>
             <p className="insights-intro">实时查看 Go 任务池与模型服务的关键状态。</p>
+            <div className="sync-status"><span className={`sync-dot${healthy ? '' : ' sync-dot-off'}`} />{lastSynced ? `最近同步 ${formatTime(lastSynced)}` : '正在连接服务…'}</div>
 
             <div className="stat-card primary-stat"><div className="stat-card-title">WORKER POOL <span>↗</span></div><div className="stat-value">{stats?.workers ?? '—'} <span>WORKERS</span></div><div className="mini-visual">{Array.from({ length: 18 }, (_, index) => <div key={index} style={{ height: `${9 + ((index * 17) % 30)}px` }} />)}</div><div className="stat-subtitle"><span className="legend-dot" />固定并发执行单元</div></div>
             <div className="stat-grid"><div className="stat-card"><div className="stat-label">待处理队列</div><div className="stat-number">{stats?.queued ?? '—'}</div><div className="stat-caption">/ {stats?.queue_capacity ?? '—'} QUEUE</div></div><div className="stat-card"><div className="stat-label">执行中任务</div><div className="stat-number">{stats?.active ?? '—'}</div><div className="stat-caption">ACTIVE TASKS</div></div></div>
