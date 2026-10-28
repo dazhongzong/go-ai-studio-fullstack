@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -99,6 +100,7 @@ func NewClient(url string) (*Client, error) {
 		done:       make(chan struct{}),
 	}
 	go client.dispatch(deliveries)
+	log.Printf("rabbitmq client ready job_queue=%s reply_queue=%s", DefaultJobQueue, replyQueue.Name)
 	return client, nil
 }
 
@@ -138,6 +140,7 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	startedAt := time.Now()
 	responseCh := make(chan result, 1)
 	c.pending.Store(correlationID, responseCh)
 	defer c.pending.Delete(correlationID)
@@ -164,12 +167,15 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("publish inference job: %w", err)
 	}
+	log.Printf("queue task published task_id=%s prompt_length=%d", correlationID, len(prompt))
 
 	select {
 	case response := <-responseCh:
 		if response.Error != "" {
+			log.Printf("queue task failed task_id=%s duration=%s error=%s", correlationID, time.Since(startedAt), response.Error)
 			return "", errors.New(response.Error)
 		}
+		log.Printf("queue task completed task_id=%s duration=%s", correlationID, time.Since(startedAt))
 		return response.Output, nil
 	case <-ctx.Done():
 		// The job may already have been consumed by an inference worker. A
@@ -178,6 +184,7 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, error) {
 		if _, stillPending := c.pending.Load(correlationID); stillPending {
 			c.publishCancel(correlationID)
 		}
+		log.Printf("queue task canceled task_id=%s duration=%s error=%v", correlationID, time.Since(startedAt), ctx.Err())
 		return "", ctx.Err()
 	case <-c.done:
 		return "", ErrClosed
@@ -229,7 +236,19 @@ type Handler func(context.Context, string) (string, error)
 
 // RunWorker consumes inference jobs. Run multiple worker processes to scale
 // inference independently from the HTTP API instances.
-func RunWorker(ctx context.Context, url string, handler Handler) error {
+func RunWorker(ctx context.Context, url, workerID string, handler Handler) error {
+	instanceID, err := randomID()
+	if err != nil {
+		return fmt.Errorf("generate worker instance id: %w", err)
+	}
+	pid := os.Getpid()
+	workerLog := func(format string, args ...interface{}) {
+		prefixArgs := []interface{}{workerID, pid, instanceID}
+		prefixArgs = append(prefixArgs, args...)
+		log.Printf("worker_id=%s pid=%d instance_id=%s "+format, prefixArgs...)
+	}
+
+	workerLog("rabbitmq worker connecting job_queue=%s", DefaultJobQueue)
 	connection, err := amqp.Dial(url)
 	if err != nil {
 		return fmt.Errorf("dial rabbitmq: %w", err)
@@ -273,6 +292,7 @@ func RunWorker(ctx context.Context, url string, handler Handler) error {
 	if err != nil {
 		return fmt.Errorf("consume rabbitmq cancellations: %w", err)
 	}
+	workerLog("rabbitmq worker ready job_queue=%s cancel_exchange=%s prefetch=%d", DefaultJobQueue, CancelExchange, 1)
 
 	type activeTask struct {
 		cancel context.CancelFunc
@@ -307,10 +327,12 @@ func RunWorker(ctx context.Context, url string, handler Handler) error {
 				activeMu.Lock()
 				if task, ok := active[delivery.CorrelationId]; ok {
 					task.cancel()
+					workerLog("inference task cancellation received task_id=%s active=true", delivery.CorrelationId)
 				} else {
 					// The cancellation can arrive before the job delivery. Keep a
 					// bounded-time tombstone so the queued job is skipped later.
 					canceled[delivery.CorrelationId] = time.Now()
+					workerLog("inference task cancellation received task_id=%s active=false", delivery.CorrelationId)
 				}
 				activeMu.Unlock()
 			}
@@ -331,12 +353,15 @@ func RunWorker(ctx context.Context, url string, handler Handler) error {
 			}
 			var request job
 			if err := json.Unmarshal(delivery.Body, &request); err != nil {
+				workerLog("inference task rejected task_id=%s error=%v", delivery.CorrelationId, err)
 				_ = publishResult(channel, delivery, result{Error: err.Error()})
 				_ = delivery.Ack(false)
 				continue
 			}
 
 			jobCtx, cancel := context.WithCancel(ctx)
+			startedAt := time.Now()
+			workerLog("inference task received task_id=%s prompt_length=%d", delivery.CorrelationId, len(request.Prompt))
 			activeMu.Lock()
 			wasCanceled := false
 			if _, ok := canceled[delivery.CorrelationId]; ok {
@@ -368,12 +393,20 @@ func RunWorker(ctx context.Context, url string, handler Handler) error {
 				response.Output = ""
 				response.Error = handlerErr.Error()
 			}
+			status := "success"
+			if handlerErr != nil {
+				status = "failed"
+				if errors.Is(handlerErr, context.Canceled) || errors.Is(handlerErr, context.DeadlineExceeded) {
+					status = "canceled"
+				}
+			}
 			if err := publishResult(channel, delivery, response); err != nil {
 				return err
 			}
 			if err := delivery.Ack(false); err != nil {
 				return fmt.Errorf("ack inference job: %w", err)
 			}
+			workerLog("inference task completed task_id=%s status=%s duration=%s", delivery.CorrelationId, status, time.Since(startedAt))
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/go-workerpool-http/internal/llm"
 	"example.com/go-workerpool-http/internal/store"
 	"example.com/go-workerpool-http/workerpool"
 )
@@ -15,6 +16,15 @@ import (
 type memoryConversationStore struct {
 	history []store.Message
 	saved   []store.Message
+}
+
+type testStreamer struct{}
+
+func (testStreamer) Stream(_ context.Context, _ string, onChunk func(llm.Chunk) error) error {
+	if err := onChunk(llm.Chunk{Response: "hello"}); err != nil {
+		return err
+	}
+	return onChunk(llm.Chunk{Done: true})
 }
 
 func (s *memoryConversationStore) EnsureConversation(context.Context, string, string) error {
@@ -132,7 +142,7 @@ func TestAskRejectsInvalidConversation(t *testing.T) {
 	h := newTestHandler(t, time.Second)
 	cases := []string{
 		`{"messages":[{"role":"assistant","content":"not a user turn"}]}`,
-		`{"messages":[{"role":"system","content":"unsupported"},{"role":"user","content":"hello"}]}`,
+		`{"messages":[{"role":"tool","content":"unsupported"},{"role":"user","content":"hello"}]}`,
 	}
 	for _, body := range cases {
 		w := httptest.NewRecorder()
@@ -140,6 +150,34 @@ func TestAskRejectsInvalidConversation(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("body=%s status=%d response=%s", body, w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestOpenAIChatCompletionsStream(t *testing.T) {
+	p, err := workerpool.New(1, 1, time.Second, SimulatedInference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	h := NewHandlerWithOptions(p, Options{Streamer: testStreamer{}, StreamTimeout: time.Second, Model: "test-model"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d response=%s", w.Code, w.Body.String())
+	}
+	for _, want := range []string{
+		`"object":"chat.completion.chunk"`,
+		`"role":"assistant"`,
+		`"content":"hello"`,
+		"data: [DONE]",
+	} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("stream response missing %q: %s", want, w.Body.String())
+		}
+	}
+	if got := w.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Errorf("content type=%q", got)
 	}
 }
 

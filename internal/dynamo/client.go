@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"example.com/go-workerpool-http/internal/ollama"
+	"example.com/go-workerpool-http/internal/llm"
 )
 
 type Client struct {
@@ -92,14 +92,14 @@ func (c *Client) request(ctx context.Context, prompt string, stream bool) (*http
 		}
 		var netErr net.Error
 		if errors.As(err, &netErr) && netErr.Timeout() {
-			return nil, fmt.Errorf("%w: %v", ollama.ErrTimeout, err)
+			return nil, fmt.Errorf("%w: %v", llm.ErrTimeout, err)
 		}
-		return nil, fmt.Errorf("%w: %v", ollama.ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: %v", llm.ErrUnavailable, err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, &ollama.HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
+		return nil, &llm.HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
 	}
 	return resp, nil
 }
@@ -112,13 +112,13 @@ func (c *Client) Generate(ctx context.Context, prompt string) (string, error) {
 	defer resp.Body.Close()
 	var output completionResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&output); err != nil {
-		return "", fmt.Errorf("%w: decode response: %v", ollama.ErrProtocol, err)
+		return "", fmt.Errorf("%w: decode response: %v", llm.ErrProtocol, err)
 	}
 	if output.Error != "" {
-		return "", fmt.Errorf("%w: %s", ollama.ErrProtocol, output.Error)
+		return "", fmt.Errorf("%w: %s", llm.ErrProtocol, output.Error)
 	}
 	if len(output.Choices) == 0 {
-		return "", fmt.Errorf("%w: response contains no choices", ollama.ErrProtocol)
+		return "", fmt.Errorf("%w: response contains no choices", llm.ErrProtocol)
 	}
 	choice := output.Choices[0]
 	if choice.Message != nil {
@@ -129,7 +129,7 @@ func (c *Client) Generate(ctx context.Context, prompt string) (string, error) {
 
 // Stream consumes the OpenAI-compatible SSE response and adapts it to the
 // existing gateway streamer interface.
-func (c *Client) Stream(ctx context.Context, prompt string, onChunk func(ollama.Chunk) error) error {
+func (c *Client) Stream(ctx context.Context, prompt string, onChunk func(llm.Chunk) error) error {
 	resp, err := c.request(ctx, prompt, true)
 	if err != nil {
 		return err
@@ -146,7 +146,7 @@ func (c *Client) Stream(ctx context.Context, prompt string, onChunk func(ollama.
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
 			if !done {
-				if err := onChunk(ollama.Chunk{Done: true}); err != nil {
+				if err := onChunk(llm.Chunk{Done: true}); err != nil {
 					return err
 				}
 			}
@@ -154,10 +154,10 @@ func (c *Client) Stream(ctx context.Context, prompt string, onChunk func(ollama.
 		}
 		var output completionResponse
 		if err := json.Unmarshal([]byte(data), &output); err != nil {
-			return fmt.Errorf("%w: decode SSE response: %v", ollama.ErrProtocol, err)
+			return fmt.Errorf("%w: decode SSE response: %v", llm.ErrProtocol, err)
 		}
 		if output.Error != "" {
-			return fmt.Errorf("%w: %s", ollama.ErrProtocol, output.Error)
+			return fmt.Errorf("%w: %s", llm.ErrProtocol, output.Error)
 		}
 		if len(output.Choices) == 0 {
 			continue
@@ -167,7 +167,7 @@ func (c *Client) Stream(ctx context.Context, prompt string, onChunk func(ollama.
 		if choice.Delta != nil {
 			text = choice.Delta.Content
 		}
-		chunk := ollama.Chunk{Response: text}
+		chunk := llm.Chunk{Response: text}
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
 			chunk.Done = true
 			done = true
@@ -180,10 +180,10 @@ func (c *Client) Stream(ctx context.Context, prompt string, onChunk func(ollama.
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("%w: read SSE response: %v", ollama.ErrProtocol, err)
+		return fmt.Errorf("%w: read SSE response: %v", llm.ErrProtocol, err)
 	}
 	if !done {
-		return fmt.Errorf("%w: stream ended before completion", ollama.ErrProtocol)
+		return fmt.Errorf("%w: stream ended before completion", llm.ErrProtocol)
 	}
 	return nil
 }

@@ -17,3 +17,9 @@ wheels/
 
 # Python tooling caches
 .uv-cache/
+
+# Dynamo local file-discovery state
+.dynamo-store-kv/
+
+# Runtime logs
+logs/

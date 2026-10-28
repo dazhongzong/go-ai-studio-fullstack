@@ -15,7 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"example.com/go-workerpool-http/internal/ollama"
+	"example.com/go-workerpool-http/internal/llm"
 	"example.com/go-workerpool-http/internal/store"
 
 	"example.com/go-workerpool-http/workerpool"
@@ -92,7 +92,7 @@ func requestID(r *http.Request) string {
 // NewHandler provides HTTP API routes using Gin.
 // Streamer is the minimal interface required by the SSE API.
 type Streamer interface {
-	Stream(context.Context, string, func(ollama.Chunk) error) error
+	Stream(context.Context, string, func(llm.Chunk) error) error
 }
 
 // Options configures HTTP admission and backend request timeouts.
@@ -213,77 +213,8 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 		case <-ctx.Done():
 			writeTaskError(c.Writer, c.Request, started, 0, ctx.Err())
 		}
-	}).POST("/ask/stream", limitAsk(opts.MaxInFlight), func(c *gin.Context) {
-		started := time.Now()
-		if opts.Streamer == nil {
-			writeRequestError(c.Writer, http.StatusServiceUnavailable, c.Request, started, 0, errors.New("enable BACKEND=dynamo to use streaming"))
-			return
-		}
-		input, rawPrompt, ok := decodeStreamInput(c.Request.Context(), c.Writer, c.Request, started, opts)
-		if !ok {
-			return
-		}
-		if err := saveUserMessage(c.Request.Context(), opts.Store, input.ConversationID, rawPrompt, requestID(c.Request), opts.Model); err != nil {
-			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, 0, err)
-			return
-		}
-		ctx, cancel := context.WithTimeout(c.Request.Context(), opts.StreamTimeout)
-		defer cancel()
-
-		responseStarted := false
-		start := func() {
-			if responseStarted {
-				return
-			}
-			responseStarted = true
-			c.Header("Content-Type", "text/event-stream; charset=utf-8")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("X-Accel-Buffering", "no")
-			c.Writer.WriteHeader(http.StatusOK)
-		}
-		send := func(event string, data any) error {
-			start()
-			buf, err := json.Marshal(data)
-			if err != nil {
-				return err
-			}
-			if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, buf); err != nil {
-				return err
-			}
-			c.Writer.Flush()
-			return nil
-		}
-		var assistant strings.Builder
-		err := opts.Streamer.Stream(ctx, input.Prompt, func(chunk ollama.Chunk) error {
-			if chunk.Response != "" {
-				assistant.WriteString(chunk.Response)
-				if err := send("token", map[string]any{"request_id": requestID(c.Request), "text": chunk.Response}); err != nil {
-					return err
-				}
-			}
-			if chunk.Done {
-				if err := saveAssistantMessage(c.Request.Context(), opts.Store, input.ConversationID, assistant.String(), requestID(c.Request), opts.Model); err != nil {
-					return err
-				}
-				return send("done", map[string]any{
-					"request_id": requestID(c.Request), "done": true,
-					"eval_count": chunk.EvalCount, "model": opts.Model,
-					"queue_ms": 0, "duration_ms": time.Since(started).Milliseconds(),
-				})
-			}
-			return nil
-		})
-		if err != nil {
-			if responseStarted {
-				_ = send("error", map[string]any{
-					"request_id": requestID(c.Request), "message": err.Error(),
-					"duration_ms": time.Since(started).Milliseconds(),
-				})
-			} else {
-				writeTaskError(c.Writer, c.Request, started, 0, err)
-			}
-		}
 	})
+	router.POST("/v1/chat/completions", limitAsk(opts.MaxInFlight), openAIChatCompletionsHandler(p, opts, &taskIDs))
 	return router
 }
 
@@ -319,39 +250,6 @@ func decodeAskInput(w http.ResponseWriter, r *http.Request) (askRequest, error) 
 	return input, nil
 }
 
-func decodeStreamInput(ctx context.Context, w http.ResponseWriter, r *http.Request, started time.Time, opts Options) (askRequest, string, bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	defer r.Body.Close()
-	var input askRequest
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&input); err != nil {
-		writeRequestError(w, http.StatusBadRequest, r, started, 0, fmt.Errorf("invalid JSON: %w", err))
-		return input, "", false
-	}
-	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
-		writeRequestError(w, http.StatusBadRequest, r, started, 0, errors.New("expected a single JSON object"))
-		return input, "", false
-	}
-	rawPrompt := strings.TrimSpace(input.Prompt)
-	prepared, err := prepareRequestPrompt(ctx, input, opts)
-	if err != nil {
-		status := http.StatusBadRequest
-		var persistenceErr *persistenceError
-		if errors.As(err, &persistenceErr) {
-			status = http.StatusInternalServerError
-		}
-		writeRequestError(w, status, r, started, 0, err)
-		return input, "", false
-	}
-	input.Prompt = prepared.prompt
-	input.ConversationID = prepared.conversationID
-	if prepared.userPrompt != "" {
-		rawPrompt = prepared.userPrompt
-	}
-	return input, rawPrompt, true
-}
-
 func validatePrompt(prompt string, maxLength int) error {
 	if prompt == "" {
 		return errors.New("prompt is required")
@@ -382,8 +280,8 @@ func preparePrompt(input askRequest, maxPromptLength, maxContextMessages, maxCon
 	for i, message := range input.Messages {
 		message.Role = strings.ToLower(strings.TrimSpace(message.Role))
 		message.Content = strings.TrimSpace(message.Content)
-		if message.Role != "user" && message.Role != "assistant" {
-			return "", fmt.Errorf("messages[%d].role must be user or assistant", i)
+		if message.Role != "user" && message.Role != "assistant" && message.Role != "system" {
+			return "", fmt.Errorf("messages[%d].role must be user, assistant, or system", i)
 		}
 		if err := validatePrompt(message.Content, maxPromptLength); err != nil {
 			return "", fmt.Errorf("messages[%d].content: %w", i, err)
@@ -395,10 +293,13 @@ func preparePrompt(input askRequest, maxPromptLength, maxContextMessages, maxCon
 		if builder.Len() > 0 {
 			builder.WriteString("\n\n")
 		}
-		if message.Role == "user" {
+		switch message.Role {
+		case "user":
 			builder.WriteString("User: ")
-		} else {
+		case "assistant":
 			builder.WriteString("Assistant: ")
+		case "system":
+			builder.WriteString("System: ")
 		}
 		builder.WriteString(message.Content)
 	}
@@ -431,6 +332,12 @@ func prepareRequestPrompt(ctx context.Context, input askRequest, opts Options) (
 		return preparedRequest{}, errors.New("conversation_id is too long")
 	}
 	userPrompt := strings.TrimSpace(input.Prompt)
+	if userPrompt == "" && len(input.Messages) > 0 {
+		lastMessage := input.Messages[len(input.Messages)-1]
+		if strings.EqualFold(strings.TrimSpace(lastMessage.Role), "user") {
+			userPrompt = strings.TrimSpace(lastMessage.Content)
+		}
+	}
 	if err := validatePrompt(userPrompt, opts.MaxPromptLength); err != nil {
 		return preparedRequest{}, err
 	}
@@ -475,24 +382,29 @@ func writeRequestError(w http.ResponseWriter, status int, r *http.Request, start
 }
 
 func writeTaskError(w http.ResponseWriter, r *http.Request, started time.Time, queueWait time.Duration, err error) {
+	status := taskErrorStatus(err)
+	var remoteErr *llm.HTTPError
+	if errors.As(err, &remoteErr) {
+		status = http.StatusBadGateway
+	}
+	writeRequestError(w, status, r, started, queueWait, err)
+}
+
+func taskErrorStatus(err error) int {
 	status := http.StatusInternalServerError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		status = http.StatusGatewayTimeout
 	case errors.Is(err, context.Canceled):
 		status = http.StatusRequestTimeout
-	case errors.Is(err, ollama.ErrTimeout):
+	case errors.Is(err, llm.ErrTimeout):
 		status = http.StatusGatewayTimeout
-	case errors.Is(err, ollama.ErrUnavailable), errors.Is(err, ollama.ErrProtocol):
+	case errors.Is(err, llm.ErrUnavailable), errors.Is(err, llm.ErrProtocol):
 		status = http.StatusBadGateway
 	case errors.Is(err, workerpool.ErrClosed):
 		status = http.StatusServiceUnavailable
 	}
-	var remoteErr *ollama.HTTPError
-	if errors.As(err, &remoteErr) {
-		status = http.StatusBadGateway
-	}
-	writeRequestError(w, status, r, started, queueWait, err)
+	return status
 }
 
 // SimulatedInference demonstrates a cancelable LLM backend. Replace later with an HTTP client.

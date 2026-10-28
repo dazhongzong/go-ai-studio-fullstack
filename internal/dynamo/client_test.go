@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/go-workerpool-http/internal/ollama"
+	"example.com/go-workerpool-http/internal/llm"
 )
 
 func TestGenerateUsesOpenAIChatCompletions(t *testing.T) {
@@ -47,7 +47,7 @@ func TestStreamSSE(t *testing.T) {
 	defer srv.Close()
 
 	var pieces []string
-	err := New(srv.URL, "test-model").Stream(context.Background(), "hello", func(chunk ollama.Chunk) error {
+	err := New(srv.URL, "test-model").Stream(context.Background(), "hello", func(chunk llm.Chunk) error {
 		pieces = append(pieces, chunk.Response)
 		return nil
 	})

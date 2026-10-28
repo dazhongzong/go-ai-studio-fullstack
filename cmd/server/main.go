@@ -18,6 +18,7 @@ import (
 	"example.com/go-workerpool-http/internal/api"
 	"example.com/go-workerpool-http/internal/config"
 	"example.com/go-workerpool-http/internal/dynamo"
+	"example.com/go-workerpool-http/internal/logging"
 	"example.com/go-workerpool-http/internal/queue"
 	"example.com/go-workerpool-http/internal/store"
 	"example.com/go-workerpool-http/workerpool"
@@ -27,6 +28,11 @@ func main() {
 	if err := config.LoadDotEnv(); err != nil {
 		log.Fatalf("load .env: %v", err)
 	}
+	closeLog, err := logging.Setup("api")
+	if err != nil {
+		log.Fatalf("setup api log: %v", err)
+	}
+	defer closeLog()
 	if strings.TrimSpace(os.Getenv("GIN_MODE")) == "" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -35,6 +41,7 @@ func main() {
 		backend = "mock"
 	}
 	model := envString("DYNAMO_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+	log.Printf("api configuration backend=%s model=%s dynamo_url=%s", backend, model, envString("DYNAMO_URL", "http://127.0.0.1:8000"))
 	maxPromptLength := envInt("MAX_PROMPT_LENGTH", api.DefaultMaxPromptLength)
 	maxContextMessages := envInt("MAX_CONTEXT_MESSAGES", api.DefaultMaxContextMessages)
 	maxContextLength := envInt("MAX_CONTEXT_LENGTH", api.DefaultMaxContextLength)
@@ -92,6 +99,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer pool.Close()
+	log.Printf("worker pool ready workers=%d queue_capacity=%d task_timeout=%s", 3, 5, taskTimeout)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -107,7 +115,7 @@ func main() {
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.ListenAndServe() }()
-	log.Printf("listening on http://localhost:%s", port)
+	log.Printf("api server listening address=http://127.0.0.1:%s", port)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -125,6 +133,7 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP shutdown: %v", err)
 	}
+	log.Println("api server stopped")
 }
 
 func envString(name, fallback string) string {
@@ -190,7 +199,7 @@ func webHandler(apiHandler http.Handler, backend, model, distDir string) http.Ha
 		}{backend, displayModel, backend == "dynamo"})
 	})
 	apiHandlerWithoutPrefix := gin.WrapH(http.StripPrefix("/api", apiHandler))
-	for _, path := range []string{"/ask", "/ask/stream", "/healthz", "/stats"} {
+	for _, path := range []string{"/ask", "/v1/chat/completions", "/healthz", "/stats"} {
 		router.Any("/api"+path, apiHandlerWithoutPrefix)
 		router.Any(path, gin.WrapH(apiHandler))
 	}

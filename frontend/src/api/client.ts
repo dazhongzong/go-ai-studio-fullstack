@@ -78,44 +78,41 @@ export async function getHealth(): Promise<boolean> {
   }
 }
 
-export async function ask(conversationId: string, prompt: string, messages: ChatMessage[], signal: AbortSignal): Promise<AskResult> {
-  const response = await fetch('/api/ask', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversation_id: conversationId, prompt, messages }),
-    signal,
-  })
-  await requireOK(response)
-  const body = (await response.json()) as {
-    reply: string
-    request_id: string
-    queue_ms: number
-    duration_ms: number
-    model: string
-  }
-  return {
-    reply: body.reply,
-    requestId: body.request_id,
-    queueMs: body.queue_ms,
-    durationMs: body.duration_ms,
-    model: body.model,
-  }
+export async function ask(conversationId: string, messages: ChatMessage[], signal: AbortSignal): Promise<AskResult> {
+	const response = await fetch('/api/v1/chat/completions', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ conversation_id: conversationId, model: 'Qwen/Qwen3-0.6B', messages, stream: false }),
+		signal,
+	})
+	await requireOK(response)
+	const body = (await response.json()) as {
+		id: string
+		model: string
+		choices: Array<{ message?: { content?: string } }>
+	}
+	return {
+		reply: body.choices[0]?.message?.content ?? '',
+		requestId: body.id,
+		queueMs: 0,
+		durationMs: 0,
+		model: body.model,
+	}
 }
 
 // POST + SSE cannot use EventSource; we parse fetch ReadableStream.
 // The buffer handles both UTF-8 splits and SSE frames crossing network chunks.
 export async function askStream(
   conversationId: string,
-  prompt: string,
   messages: ChatMessage[],
   signal: AbortSignal,
   onEvent: (event: StreamEvent) => void,
 ): Promise<void> {
-  const response = await fetch('/api/ask/stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversation_id: conversationId, prompt, messages }),
-    signal,
+	const response = await fetch('/api/v1/chat/completions', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ conversation_id: conversationId, model: 'Qwen/Qwen3-0.6B', messages, stream: true }),
+		signal,
   })
   await requireOK(response)
   if (!response.body) throw new Error('浏览器不支持流式响应')
@@ -125,36 +122,38 @@ export async function askStream(
   let buffered = ''
   let done = false
 
-  const parseFrame = (frame: string): void => {
-    let eventName = 'message'
-    const parts: string[] = []
-    for (const line of frame.split('\n')) {
-      if (line.startsWith('event:')) eventName = line.slice(6).trim()
-      if (line.startsWith('data:')) parts.push(line.slice(5).trimStart())
-    }
-    if (!parts.length) return
-    const payload = JSON.parse(parts.join('\n')) as Record<string, unknown>
-    if (eventName === 'token') {
-      onEvent({ type: 'token', text: String(payload.text ?? '') })
-    } else if (eventName === 'done') {
-      done = true
-      onEvent({
-        type: 'done',
-        evalCount: Number(payload.eval_count ?? 0),
-        requestId: String(payload.request_id ?? ''),
-        queueMs: Number(payload.queue_ms ?? 0),
-        durationMs: Number(payload.duration_ms ?? 0),
-        model: String(payload.model ?? ''),
-      })
-    } else if (eventName === 'error') {
-      done = true
-      onEvent({
-        type: 'error',
-        message: String(payload.message ?? '流式生成失败'),
-        requestId: String(payload.request_id ?? ''),
-        durationMs: Number(payload.duration_ms ?? 0),
-      })
-    }
+	const parseFrame = (frame: string): void => {
+		const parts: string[] = []
+		for (const line of frame.split('\n')) {
+			if (line.startsWith('data:')) parts.push(line.slice(5).trimStart())
+		}
+		if (!parts.length) return
+		const data = parts.join('\n')
+		if (data === '[DONE]') {
+			done = true
+			return
+		}
+		const payload = JSON.parse(data) as {
+			id?: string
+			model?: string
+			error?: { message?: string }
+			choices?: Array<{
+				delta?: { content?: string }
+				finish_reason?: string | null
+			}>
+		}
+		if (payload.error) {
+			done = true
+			onEvent({ type: 'error', message: payload.error.message ?? '流式生成失败', requestId: payload.id })
+			return
+		}
+		const choice = payload.choices?.[0]
+		const text = choice?.delta?.content ?? ''
+		if (text) onEvent({ type: 'token', text })
+		if (choice?.finish_reason) {
+			done = true
+			onEvent({ type: 'done', requestId: payload.id, model: payload.model })
+		}
   }
 
   const consumeFrames = (): void => {
