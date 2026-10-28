@@ -20,6 +20,7 @@ import (
 	"example.com/go-workerpool-http/internal/config"
 	"example.com/go-workerpool-http/internal/dynamo"
 	"example.com/go-workerpool-http/internal/logging"
+	"example.com/go-workerpool-http/internal/metrics"
 	"example.com/go-workerpool-http/internal/queue"
 	"example.com/go-workerpool-http/internal/store"
 	"example.com/go-workerpool-http/workerpool"
@@ -29,6 +30,8 @@ func main() {
 	if err := config.LoadDotEnv(); err != nil {
 		log.Fatalf("load .env: %v", err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	closeLog, err := logging.Setup("api")
 	if err != nil {
 		log.Fatalf("setup api log: %v", err)
@@ -49,13 +52,15 @@ func main() {
 	maxInFlight := envInt("MAX_IN_FLIGHT", 8)
 	poolWorkers := envInt("POOL_WORKERS", 3)
 	poolQueueSize := envInt("POOL_QUEUE_SIZE", 5)
+	requestMetrics := metrics.New()
 	handler := workerpool.Handler(api.SimulatedInference)
 	opts := api.Options{
 		MaxInFlight: maxInFlight, AskTimeout: 1500 * time.Millisecond,
 		StreamTimeout: 2 * time.Minute, AccessLog: true,
 		Model: model, MaxPromptLength: maxPromptLength,
 		MaxContextMessages: maxContextMessages, MaxContextLength: maxContextLength,
-		APIKey: strings.TrimSpace(os.Getenv("API_KEY")),
+		APIKey:  strings.TrimSpace(os.Getenv("API_KEY")),
+		Metrics: requestMetrics,
 	}
 	var conversationStore *store.MySQLStore
 	if dsn := strings.TrimSpace(os.Getenv("MYSQL_DSN")); dsn != "" {
@@ -86,7 +91,7 @@ func main() {
 	var queueClient *queue.Client
 	if queueURL := strings.TrimSpace(os.Getenv("QUEUE_URL")); queueURL != "" {
 		var err error
-		queueClient, err = queue.NewClient(queueURL)
+		queueClient, err = queue.NewClientWithRetry(ctx, queueURL, durationEnv("QUEUE_RETRY_INTERVAL", 2*time.Second))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -147,8 +152,6 @@ func main() {
 	go func() { serveErr <- server.ListenAndServe() }()
 	log.Printf("api server listening address=http://127.0.0.1:%s", port)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	select {
 	case <-ctx.Done():
 		log.Println("shutdown signal received")
@@ -229,7 +232,7 @@ func webHandler(apiHandler http.Handler, backend, model, distDir string) http.Ha
 		}{backend, displayModel, backend == "dynamo"})
 	})
 	apiHandlerWithoutPrefix := gin.WrapH(http.StripPrefix("/api", apiHandler))
-	for _, path := range []string{"/ask", "/v1/chat/completions", "/healthz", "/livez", "/readyz", "/stats"} {
+	for _, path := range []string{"/ask", "/v1/chat/completions", "/healthz", "/livez", "/readyz", "/stats", "/metrics"} {
 		router.Any("/api"+path, apiHandlerWithoutPrefix)
 		router.Any(path, gin.WrapH(apiHandler))
 	}

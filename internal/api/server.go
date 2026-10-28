@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"example.com/go-workerpool-http/internal/llm"
+	"example.com/go-workerpool-http/internal/metrics"
 	"example.com/go-workerpool-http/internal/store"
 
 	"example.com/go-workerpool-http/workerpool"
@@ -75,6 +76,19 @@ func logRequests() gin.HandlerFunc {
 	}
 }
 
+func observeMetrics(registry *metrics.Registry) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if registry == nil {
+			c.Next()
+			return
+		}
+		registry.RequestStarted()
+		started := time.Now()
+		c.Next()
+		registry.RequestFinished(c.Writer.Status(), time.Since(started))
+	}
+}
+
 func withRequestID(ids *atomic.Uint64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := newRequestID()
@@ -123,6 +137,7 @@ type Options struct {
 	APIKey             string
 	Readiness          func(context.Context) error
 	Store              store.ConversationStore
+	Metrics            *metrics.Registry
 }
 
 func NewHandler(p *workerpool.Pool) http.Handler {
@@ -158,7 +173,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 	var taskIDs atomic.Uint64
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
-	router.Use(gin.Recovery(), withRequestID(&requestIDs))
+	router.Use(gin.Recovery(), withRequestID(&requestIDs), observeMetrics(opts.Metrics))
 	if opts.AccessLog {
 		router.Use(logRequests())
 	}
@@ -176,6 +191,24 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 	router.GET("/readyz", readinessHandler(opts.Readiness))
 	router.GET("/stats", func(c *gin.Context) {
 		c.JSON(http.StatusOK, p.Snapshot())
+	})
+	router.GET("/metrics", func(c *gin.Context) {
+		if opts.Metrics == nil {
+			c.String(http.StatusNotImplemented, "metrics are disabled\n")
+			return
+		}
+		opts.Metrics.ServeHTTP(c.Writer, func(w io.Writer) error {
+			stats := p.Snapshot()
+			_, err := fmt.Fprintf(w,
+				"# HELP gateway_pool_active Active worker-pool tasks.\n# TYPE gateway_pool_active gauge\ngateway_pool_active %d\n"+
+					"# HELP gateway_pool_queued Tasks waiting in the worker-pool queue.\n# TYPE gateway_pool_queued gauge\ngateway_pool_queued %d\n"+
+					"# HELP gateway_pool_submitted_total Tasks accepted by the worker pool.\n# TYPE gateway_pool_submitted_total counter\ngateway_pool_submitted_total %d\n"+
+					"# HELP gateway_pool_completed_total Tasks completed by the worker pool.\n# TYPE gateway_pool_completed_total counter\ngateway_pool_completed_total %d\n"+
+					"# HELP gateway_pool_failed_total Tasks failed in the worker pool.\n# TYPE gateway_pool_failed_total counter\ngateway_pool_failed_total %d\n"+
+					"# HELP gateway_pool_rejected_total Tasks rejected by the worker pool.\n# TYPE gateway_pool_rejected_total counter\ngateway_pool_rejected_total %d\n",
+				stats.Active, stats.Queued, stats.Submitted, stats.Completed, stats.Failed, stats.Rejected)
+			return err
+		})
 	})
 	protect := requireAPIKey(opts.APIKey)
 	router.POST("/ask", protect, limitAsk(opts.MaxInFlight), func(c *gin.Context) {

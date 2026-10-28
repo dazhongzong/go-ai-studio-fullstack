@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"example.com/go-workerpool-http/internal/llm"
+	"example.com/go-workerpool-http/internal/metrics"
 	"example.com/go-workerpool-http/internal/store"
 	"example.com/go-workerpool-http/workerpool"
 )
@@ -245,6 +246,30 @@ func TestReadiness(t *testing.T) {
 	h.ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/livez", nil))
 	if live.Code != http.StatusOK {
 		t.Fatalf("livez status=%d", live.Code)
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	p, err := workerpool.New(1, 1, time.Second, SimulatedInference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	h := NewHandlerWithOptions(p, Options{AskTimeout: time.Second, Metrics: metrics.New()})
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(`{"prompt":"metrics"}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("ask status=%d response=%s", w.Code, w.Body.String())
+	}
+
+	metricsResponse := httptest.NewRecorder()
+	h.ServeHTTP(metricsResponse, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := metricsResponse.Body.String()
+	for _, want := range []string{"gateway_requests_total 1", "gateway_pool_completed_total 1", "gateway_pool_active 0"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q: %s", want, body)
+		}
 	}
 }
 

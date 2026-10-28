@@ -39,6 +39,7 @@ type Client struct {
 	publisher  *amqp.Channel
 	replies    *amqp.Channel
 	replyQueue string
+	confirms   chan amqp.Confirmation
 
 	publishMu sync.Mutex
 	pending   sync.Map // correlation ID -> chan result
@@ -73,6 +74,14 @@ func NewClient(url string) (*Client, error) {
 		_ = connection.Close()
 		return nil, fmt.Errorf("open rabbitmq reply channel: %w", err)
 	}
+	if err := publisher.Confirm(false); err != nil {
+		_ = replies.Close()
+		_ = publisher.Close()
+		_ = connection.Close()
+		return nil, fmt.Errorf("enable rabbitmq publisher confirms: %w", err)
+	}
+	confirms := make(chan amqp.Confirmation, 16)
+	publisher.NotifyPublish(confirms)
 	if _, err := publisher.QueueDeclare(DefaultJobQueue, true, false, false, false, nil); err != nil {
 		_ = replies.Close()
 		_ = publisher.Close()
@@ -105,11 +114,36 @@ func NewClient(url string) (*Client, error) {
 		publisher:  publisher,
 		replies:    replies,
 		replyQueue: replyQueue.Name,
+		confirms:   confirms,
 		done:       make(chan struct{}),
 	}
 	go client.dispatch(deliveries)
 	log.Printf("rabbitmq client ready job_queue=%s reply_queue=%s", DefaultJobQueue, replyQueue.Name)
 	return client, nil
+}
+
+// NewClientWithRetry keeps retrying startup while ctx is alive. It is useful
+// for container deployments where RabbitMQ may become healthy after the API.
+func NewClientWithRetry(ctx context.Context, url string, retryInterval time.Duration) (*Client, error) {
+	if retryInterval <= 0 {
+		retryInterval = time.Second
+	}
+	for {
+		client, err := NewClient(url)
+		if err == nil {
+			return client, nil
+		}
+		log.Printf("rabbitmq client connect failed, retrying in %s: %v", retryInterval, err)
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (c *Client) dispatch(deliveries <-chan amqp.Delivery) {
@@ -157,21 +191,13 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	c.publishMu.Lock()
-	select {
-	case <-c.done:
-		c.publishMu.Unlock()
-		return "", ErrClosed
-	default:
-	}
-	err = c.publisher.PublishWithContext(ctx, "", DefaultJobQueue, false, false, amqp.Publishing{
+	err = c.publish(ctx, "", DefaultJobQueue, amqp.Publishing{
 		ContentType:   "application/json",
 		CorrelationId: correlationID,
 		ReplyTo:       c.replyQueue,
 		DeliveryMode:  amqp.Persistent,
 		Body:          body,
 	})
-	c.publishMu.Unlock()
 	if err != nil {
 		return "", fmt.Errorf("publish inference job: %w", err)
 	}
@@ -204,22 +230,44 @@ func (c *Client) publishCancel(correlationID string) {
 	// best effort: the API already has a terminal error to return to its caller.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	c.publishMu.Lock()
-	select {
-	case <-c.done:
-		c.publishMu.Unlock()
-		return
-	default:
-	}
-	err := c.publisher.PublishWithContext(ctx, CancelExchange, "", false, false, amqp.Publishing{
+	err := c.publish(ctx, CancelExchange, "", amqp.Publishing{
 		ContentType:   "application/json",
 		CorrelationId: correlationID,
 		DeliveryMode:  amqp.Persistent,
 		Type:          "inference.cancel",
 	})
-	c.publishMu.Unlock()
 	if err != nil {
 		log.Printf("rabbitmq: publish cancellation task_id=%s: %v", correlationID, err)
+	}
+}
+
+// publish serializes publishing on the channel and waits for RabbitMQ's
+// publisher confirmation. Without this, a successful Publish call only means
+// the client wrote to its socket, not that the broker accepted the message.
+func (c *Client) publish(ctx context.Context, exchange, routingKey string, message amqp.Publishing) error {
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+	select {
+	case <-c.done:
+		return ErrClosed
+	default:
+	}
+	if err := c.publisher.PublishWithContext(ctx, exchange, routingKey, false, false, message); err != nil {
+		return err
+	}
+	select {
+	case confirmation, ok := <-c.confirms:
+		if !ok {
+			return ErrClosed
+		}
+		if !confirmation.Ack {
+			return errors.New("rabbitmq publisher nack")
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return ErrClosed
 	}
 }
 
@@ -245,6 +293,32 @@ type Handler func(context.Context, string) (string, error)
 // RunWorker consumes inference jobs. Run multiple worker processes to scale
 // inference independently from the HTTP API instances.
 func RunWorker(ctx context.Context, url, workerID string, handler Handler) error {
+	backoff := time.Second
+	for {
+		err := runWorkerOnce(ctx, url, workerID, handler)
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		log.Printf("rabbitmq worker disconnected, retrying in %s: %v", backoff, err)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func runWorkerOnce(ctx context.Context, url, workerID string, handler Handler) error {
 	instanceID, err := randomID()
 	if err != nil {
 		return fmt.Errorf("generate worker instance id: %w", err)
@@ -267,6 +341,11 @@ func RunWorker(ctx context.Context, url, workerID string, handler Handler) error
 		return fmt.Errorf("open rabbitmq worker channel: %w", err)
 	}
 	defer channel.Close()
+	if err := channel.Confirm(false); err != nil {
+		return fmt.Errorf("enable rabbitmq worker publisher confirms: %w", err)
+	}
+	confirmations := make(chan amqp.Confirmation, 16)
+	channel.NotifyPublish(confirmations)
 	if _, err := channel.QueueDeclare(DefaultJobQueue, true, false, false, false, nil); err != nil {
 		return fmt.Errorf("declare rabbitmq worker queue: %w", err)
 	}
@@ -362,7 +441,9 @@ func RunWorker(ctx context.Context, url, workerID string, handler Handler) error
 			var request job
 			if err := json.Unmarshal(delivery.Body, &request); err != nil {
 				workerLog("inference task rejected task_id=%s error=%v", delivery.CorrelationId, err)
-				_ = publishResult(channel, delivery, result{Error: err.Error()})
+				if publishErr := publishResult(channel, confirmations, delivery, result{Error: err.Error()}); publishErr != nil {
+					return publishErr
+				}
 				_ = delivery.Ack(false)
 				continue
 			}
@@ -408,7 +489,7 @@ func RunWorker(ctx context.Context, url, workerID string, handler Handler) error
 					status = "canceled"
 				}
 			}
-			if err := publishResult(channel, delivery, response); err != nil {
+			if err := publishResult(channel, confirmations, delivery, response); err != nil {
 				return err
 			}
 			if err := delivery.Ack(false); err != nil {
@@ -419,17 +500,27 @@ func RunWorker(ctx context.Context, url, workerID string, handler Handler) error
 	}
 }
 
-func publishResult(channel *amqp.Channel, delivery amqp.Delivery, response result) error {
+func publishResult(channel *amqp.Channel, confirmations <-chan amqp.Confirmation, delivery amqp.Delivery, response result) error {
 	body, err := json.Marshal(response)
 	if err != nil {
 		return err
 	}
-	return channel.PublishWithContext(context.Background(), "", delivery.ReplyTo, false, false, amqp.Publishing{
+	if err := channel.PublishWithContext(context.Background(), "", delivery.ReplyTo, false, false, amqp.Publishing{
 		ContentType:   "application/json",
 		CorrelationId: delivery.CorrelationId,
 		DeliveryMode:  amqp.Persistent,
 		Body:          body,
-	})
+	}); err != nil {
+		return err
+	}
+	confirmation, ok := <-confirmations
+	if !ok {
+		return ErrClosed
+	}
+	if !confirmation.Ack {
+		return errors.New("rabbitmq worker publisher nack")
+	}
+	return nil
 }
 
 func randomID() (string, error) {

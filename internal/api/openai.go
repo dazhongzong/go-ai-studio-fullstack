@@ -140,7 +140,16 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 		writeOpenAIError(c.Writer, http.StatusServiceUnavailable, errors.New("streaming is not enabled"))
 		return
 	}
+	streamStarted := time.Now()
+	streamFailed := false
+	if opts.Metrics != nil {
+		opts.Metrics.StreamStarted()
+		defer func() {
+			opts.Metrics.StreamFinished(time.Since(streamStarted), streamFailed)
+		}()
+	}
 	if err := saveUserMessage(c.Request.Context(), opts.Store, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
+		streamFailed = true
 		writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
 		return
 	}
@@ -182,6 +191,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 	}
 
 	if err := writeChunk(&openAIDelta{Role: "assistant"}, nil); err != nil {
+		streamFailed = true
 		return
 	}
 	var assistant strings.Builder
@@ -219,6 +229,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 		}
 	}
 	if err != nil {
+		streamFailed = true
 		_ = writeData(openAIErrorBody{Error: openAIError{
 			Message: err.Error(), Type: openAIErrorType(err), Param: nil, Code: nil,
 		}})

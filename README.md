@@ -24,6 +24,7 @@ Go API Gateway（Gin）
 - RabbitMQ：项目中的非流式任务队列，可选。
 - MySQL：会话和消息持久化，可选。
 - 流式请求使用 OpenAI-compatible SSE，不经过 RabbitMQ Worker Pool。
+- `/metrics`：Prometheus 文本格式，包含请求、流式请求和 Worker Pool 指标。
 
 ## 目录
 
@@ -163,6 +164,7 @@ WORKER_ID=worker-1 go run ./cmd/inference-worker
 ~~~
 
 多个 Worker 使用不同的 WORKER_ID，不需要监听不同端口。它们共同消费 RabbitMQ 的 inference.jobs 队列。
+API 启动时会等待 RabbitMQ 可用；Worker 连接断开后会按指数退避自动重连。发布任务和推理结果都使用 RabbitMQ publisher confirms。
 
 ## API
 
@@ -197,6 +199,7 @@ GET  /api/healthz   健康检查
 GET  /api/livez     进程存活检查
 GET  /api/readyz    依赖就绪检查
 GET  /api/stats     Worker Pool 统计
+GET  /api/metrics   Prometheus 指标
 POST /api/ask       Worker Pool 学习接口
 ~~~
 
@@ -217,6 +220,8 @@ make test
 make race
 make vet
 make build
+# RabbitMQ 已启动时执行集成测试
+make integration
 ~~~
 
 日志输出到终端和：
@@ -226,4 +231,4 @@ logs/api.log
 logs/inference-worker.log
 ~~~
 
-当前项目是本地学习用 MVP，尚未包含用户登录、权限控制、限流认证和生产级密钥管理，不建议直接暴露到公网。
+当前项目仍是本地学习用 MVP。已提供可选 API Key、并发限制、就绪检查和基础指标；生产环境仍应接入正式身份认证、密钥管理、TLS、Prometheus/Grafana 和更完整的消息重试/DLQ 策略。
