@@ -14,7 +14,7 @@ import (
 	"example.com/go-workerpool-http/workerpool"
 )
 
-// Example: go test ./internal/api -run '^$' -bench '^BenchmarkAsk$' -benchtime=2s -cpu=4 -benchmem
+// Example: go test ./backend/internal/api -run '^$' -bench '^BenchmarkAsk$' -benchtime=2s -cpu=4 -benchmem
 func BenchmarkAsk(b *testing.B) {
 	for _, workers := range []int{1, 3, 6} {
 		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {

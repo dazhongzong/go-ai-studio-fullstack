@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+logs
+bin
+frontend/node_modules
+frontend/dist
+.dynamo-venv
+.venv
+.uv-cache
+middleware/dynamo/.venv
+middleware/dynamo/.dynamo-venv
+middleware/dynamo/.uv-cache
+.dynamo-store-kv
+go.work.sum

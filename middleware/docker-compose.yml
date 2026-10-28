@@ -1,0 +1,151 @@
+name: go-ai-studio
+
+x-go-build: &go-build
+  context: ..
+  dockerfile: backend/Dockerfile
+
+x-common-env: &common-env
+  BACKEND: ${BACKEND:-dynamo}
+  DYNAMO_URL: ${DOCKER_DYNAMO_URL:-http://host.docker.internal:8000}
+  DYNAMO_MODEL: ${DYNAMO_MODEL:-Qwen/Qwen3-0.6B}
+  QUEUE_URL: amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
+  QUEUE_RETRY_INTERVAL: ${QUEUE_RETRY_INTERVAL:-2s}
+  MYSQL_DSN: root:${MYSQL_ROOT_PASSWORD:-root}@tcp(mysql:3306)/${MYSQL_DATABASE:-go_ai_studio}?parseTime=true
+  API_KEY: ${API_KEY:-}
+  MAX_IN_FLIGHT: ${MAX_IN_FLIGHT:-8}
+  POOL_WORKERS: ${POOL_WORKERS:-3}
+  POOL_QUEUE_SIZE: ${POOL_QUEUE_SIZE:-5}
+  TASK_TIMEOUT: ${TASK_TIMEOUT:-90s}
+  ASK_TIMEOUT: ${ASK_TIMEOUT:-100s}
+  STREAM_TIMEOUT: ${STREAM_TIMEOUT:-180s}
+  MAX_PROMPT_LENGTH: ${MAX_PROMPT_LENGTH:-8192}
+  MAX_CONTEXT_MESSAGES: ${MAX_CONTEXT_MESSAGES:-24}
+  MAX_CONTEXT_LENGTH: ${MAX_CONTEXT_LENGTH:-32768}
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-go_ai_studio}
+    ports:
+      - "3306:3306"
+    volumes:
+      - go_ai_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - go_ai_rabbitmq:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api-1:
+    build:
+      <<: *go-build
+      target: api
+      args:
+        VITE_API_KEY: ${API_KEY:-}
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      PORT: 8080
+      WORKER_ID: api-1
+      LOG_DIR: /app/logs/api-1
+    volumes:
+      - ../logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/livez"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api-2:
+    build:
+      <<: *go-build
+      target: api
+      args:
+        VITE_API_KEY: ${API_KEY:-}
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      PORT: 8080
+      WORKER_ID: api-2
+      LOG_DIR: /app/logs/api-2
+    volumes:
+      - ../logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/livez"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  inference-worker:
+    build:
+      <<: *go-build
+      target: worker
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      WORKER_ID: worker-1
+      LOG_DIR: /app/logs/worker-1
+    volumes:
+      - ../logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "8088:80"
+    volumes:
+      - ./nginx/nginx.docker.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+
+volumes:
+  go_ai_mysql:
+  go_ai_rabbitmq:
