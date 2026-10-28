@@ -108,7 +108,14 @@ func newRequestID() string {
 	if _, err := rand.Read(value[:]); err != nil {
 		return ""
 	}
-	return "req-" + hex.EncodeToString(value[:])
+	// RFC 4122 version 4 UUID: random payload with version and variant bits set.
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return "req-" + hex.EncodeToString(value[0:4]) + "-" +
+		hex.EncodeToString(value[4:6]) + "-" +
+		hex.EncodeToString(value[6:8]) + "-" +
+		hex.EncodeToString(value[8:10]) + "-" +
+		hex.EncodeToString(value[10:16])
 }
 
 func requestID(r *http.Request) string {

@@ -1,237 +1,171 @@
 # Go AI Studio
 
-基于 Go、React、NVIDIA Dynamo 和 SGLang 的本地 LLM 推理网关学习项目。
+基于 Go/Gin、RabbitMQ、NVIDIA Dynamo/SGLang 和 React 的分布式 LLM 推理网关，适合作为实习项目展示。
 
 ## 架构
 
-~~~text
-React + Vite
-     │
-     ▼
-Go API Gateway（Gin）
-     ├── stream=false → Worker Pool → RabbitMQ（可选）→ inference-worker
-     │                                                        │
-     │                                                        ▼
-     │                                                     Dynamo
-     │
-     └── stream=true  ─────────────────────────────────────► Dynamo SSE
-                                                              │
-                                                              ▼
-                                                           SGLang/GPU
-~~~
+```text
+React/Vite ──HTTP/SSE──▶ Nginx(可选) ──▶ Go API Gateway / Gin
+                                             │
+                         ┌───────────────────┴──────────────────┐
+                         │                                      │
+                   stream=false                           stream=true
+                         │                                      │
+                    Worker Pool ──▶ RabbitMQ              Dynamo SSE
+                         │                                      │
+                    inference-worker ──▶ Dynamo/SGLang ──▶ GPU
 
-- etcd + NATS：Dynamo 的服务发现和事件通信。
-- RabbitMQ：项目中的非流式任务队列，可选。
-- MySQL：会话和消息持久化，可选。
-- `X-Client-ID`：匿名浏览器会话隔离标识；后续可替换为登录后的 `user_id`。
-- 流式请求使用 OpenAI-compatible SSE，不经过 RabbitMQ Worker Pool。
-- `/metrics`：Prometheus 文本格式，包含请求、流式请求和 Worker Pool 指标。
+                         MySQL：会话和消息持久化
+                         etcd + NATS：Dynamo 服务发现和事件通信
+```
 
-## 目录
+### 请求链路
 
-~~~text
-cmd/server/              Go API 网关
-cmd/inference-worker/    RabbitMQ 推理消费者
-internal/api/            Gin 路由和 OpenAI API
-internal/dynamo/         Dynamo HTTP/SSE 客户端
-internal/llm/            推理协议和错误类型
-internal/queue/          RabbitMQ RPC
-internal/store/          MySQL 存储
-workerpool/              Worker Pool
-frontend/                React + TypeScript + Vite
-deploy/nginx.conf        Nginx 负载均衡配置
-deploy/nginx.dev.conf    Nginx 开发环境配置
-docker-compose.yml       MySQL、RabbitMQ
-pyproject.toml           uv/Dynamo 依赖
-~~~
+```mermaid
+flowchart LR
+    A[React / OpenAI SDK] --> B[Nginx 可选]
+    B --> C[Go API Gateway]
+    C --> D{stream?}
+    D -- false --> E[Worker Pool]
+    E --> F[RabbitMQ RPC]
+    F --> G[inference-worker]
+    G --> H[Dynamo / SGLang]
+    H --> G --> F --> E --> C
+    D -- true --> I[Dynamo SSE]
+    I --> C --> A
+    C --> J[(MySQL)]
+```
+
+- 非流式请求经过 Worker Pool 和 RabbitMQ，适合排队、限流和多 Worker 扩展。
+- 流式请求使用 OpenAI-compatible SSE，当前直接连接 Dynamo，不经过 RabbitMQ Worker Pool。
+- MySQL 保存会话和消息；前端通过 `X-Client-ID` 做匿名会话隔离。
 
 ## 配置
 
-~~~bash
+不要提交本地 `.env`。首次运行：
+
+```bash
 cp .env.example .env
-~~~
+```
 
-常用配置：
-
-~~~env
+```env
 BACKEND=dynamo
 PORT=18080
 DYNAMO_URL=http://127.0.0.1:8000
 DYNAMO_MODEL=Qwen/Qwen3-0.6B
 API_KEY=
+QUEUE_URL=amqp://guest:guest@127.0.0.1:5672/
+QUEUE_RETRY_INTERVAL=2s
+MYSQL_DSN=root:root@tcp(127.0.0.1:3306)/go_ai_studio?parseTime=true
 MAX_IN_FLIGHT=8
 POOL_WORKERS=3
 POOL_QUEUE_SIZE=5
+TASK_TIMEOUT=90s
+ASK_TIMEOUT=100s
+STREAM_TIMEOUT=180s
+```
 
-# 可选：RabbitMQ 非流式任务队列
-QUEUE_URL=amqp://guest:guest@127.0.0.1:5672/
+`root:root` 只适用于本地 Compose 学习环境，非本地环境必须更换账号密码。Go API 和 inference-worker 会自动读取项目根目录 `.env`。
 
-# 可选：MySQL 多轮会话存储
-MYSQL_DSN=root:root@tcp(127.0.0.1:3306)/go_ai_studio?parseTime=true
-~~~
+## 启动流程
 
-Go 服务和 inference-worker 会自动读取项目根目录的 .env。
+### 1. 启动基础设施
 
-## 启动 Dynamo
+```bash
+docker compose up -d mysql rabbitmq
+docker compose ps
+```
 
-使用 Python/uv 安装 Dynamo 后，etcd 和 NATS 仍需要单独启动。进入 Dynamo 源码目录执行：
+### 2. 启动 Dynamo
 
-~~~bash
+在 Dynamo 源码目录启动 etcd 和 NATS：
+
+```bash
 docker compose -f dev/docker-compose.yml up -d
-~~~
-
-然后使用相同配置启动 Dynamo 前端和 Worker：
-
-~~~bash
-export DYN_DISCOVERY_BACKEND=etcd
-export DYN_EVENT_PLANE=nats
-export DYN_REQUEST_PLANE=tcp
-export ETCD_ENDPOINTS=http://127.0.0.1:2379
-export NATS_SERVER=nats://127.0.0.1:4222
-export DYN_NAMESPACE=go-ai-studio
-~~~
+```
 
 启动 Dynamo frontend：
 
-~~~bash
-python -m dynamo.frontend \
-  --http-port 8000 \
-  --discovery-backend etcd \
-  --router-min-initial-workers 1
-~~~
+```bash
+python -m dynamo.frontend --http-port 8000 --discovery-backend etcd --router-min-initial-workers 1
+```
 
 启动 SGLang Worker：
 
-~~~bash
-CUDA_VISIBLE_DEVICES=0 python -m dynamo.sglang \
-  --model-path Qwen/Qwen3-0.6B
-~~~
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m dynamo.sglang --model-path Qwen/Qwen3-0.6B
+```
 
-确认 Dynamo 正常：
+检查 Dynamo：
 
-~~~bash
+```bash
 curl -i http://127.0.0.1:8000/live
 curl -i http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/v1/models
-~~~
+```
 
-## 启动项目
+### 3. 启动 Go API、Worker 和前端
 
-如果启用 MySQL 和 RabbitMQ：
-
-~~~bash
-docker compose up -d mysql rabbitmq
-~~~
-
-启动 Go API：
-
-~~~bash
+```bash
 go run ./cmd/server
-~~~
-
-默认地址：http://127.0.0.1:18080
-
-如果配置了 API_KEY，前端开发环境还需要在 `frontend/.env.local` 中配置相同的 `VITE_API_KEY`。
-
-启动 React 开发服务：
-
-~~~bash
-cd frontend
-npm install
-npm run dev
-~~~
-
-前端地址：http://127.0.0.1:5173
-
-生产构建：
-
-~~~bash
-cd frontend
-npm run build
-cd ..
-go run ./cmd/server
-~~~
-
-构建后的页面由 Go 服务从 frontend/dist 提供。
-
-生产环境使用 `deploy/nginx.conf`；本地 Vite 开发环境使用 `deploy/nginx.dev.conf`。
-
-## RabbitMQ Worker 模式
-
-启动一个或多个推理消费者：
-
-~~~bash
 WORKER_ID=worker-1 go run ./cmd/inference-worker
-~~~
+```
 
-多个 Worker 使用不同的 WORKER_ID，不需要监听不同端口。它们共同消费 RabbitMQ 的 inference.jobs 队列。
-API 启动时会等待 RabbitMQ 可用；Worker 连接断开后会按指数退避自动重连。发布任务和推理结果都使用 RabbitMQ publisher confirms。
+可以启动多个 Worker；它们共同消费 `inference.jobs`，不需要监听不同端口。
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+前端地址：http://127.0.0.1:5173；API 地址：http://127.0.0.1:18080。生产构建后，Go 从 `frontend/dist` 提供页面；Nginx 配置位于 `deploy/nginx.conf`。
 
 ## API
 
-OpenAI-compatible 非流式请求：
-
-~~~bash
+```bash
 curl http://127.0.0.1:18080/api/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model":"Qwen/Qwen3-0.6B",
-    "messages":[{"role":"user","content":"你好"}],
-    "stream":false
-  }'
-~~~
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'X-Client-ID: local-browser-1' \
+  -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"你好"}],"stream":false}'
+```
 
-OpenAI-compatible 流式请求：
+流式请求将 `stream` 改为 `true`，并使用 `curl -N`。
 
-~~~bash
-curl -N http://127.0.0.1:18080/api/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model":"Qwen/Qwen3-0.6B",
-    "messages":[{"role":"user","content":"介绍一下 Go"}],
-    "stream":true
-  }'
-~~~
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/api/healthz` | 基础健康检查 |
+| GET | `/api/livez` | 进程存活检查 |
+| GET | `/api/readyz` | Dynamo、RabbitMQ、MySQL 就绪检查 |
+| GET | `/api/stats` | Worker Pool 统计 |
+| GET | `/api/metrics` | Prometheus 指标 |
+| GET | `/api/conversations` | 当前客户端会话列表 |
+| DELETE | `/api/conversations/:id` | 删除当前客户端会话 |
+| POST | `/api/ask` | Worker Pool 学习接口 |
+| POST | `/api/v1/chat/completions` | OpenAI-compatible 推理接口 |
 
-其他接口：
+## 故障恢复
 
-~~~text
-GET  /api/healthz   健康检查
-GET  /api/livez     进程存活检查
-GET  /api/readyz    依赖就绪检查
-GET  /api/stats     Worker Pool 统计
-GET  /api/metrics   Prometheus 指标
-GET  /api/conversations       当前客户端的会话列表
-DELETE /api/conversations/:id 删除当前客户端的会话
-POST /api/ask       Worker Pool 学习接口
-~~~
+- API 启动时连接 RabbitMQ 失败，会按照 `QUEUE_RETRY_INTERVAL` 重试。
+- Worker 断线后按照 1、2、4、8 秒退避重连，最大间隔 30 秒。
+- Worker 使用手动 ACK；Worker 崩溃时，未 ACK 的消息会被 RabbitMQ 重新投递。
+- API 和 Worker 的消息发布启用了 Publisher Confirm，避免仅写入客户端 socket 就误判成功。
+- `/readyz` 反映 Dynamo、RabbitMQ、MySQL 状态，便于摘除未就绪实例。
+- 当前未实现消息 TTL、死信队列和业务失败重试，生产环境需要补充这些策略。
 
-## 测试和日志
+## 测试、构建和日志
 
-~~~bash
-go test ./...
-go vet ./...
-
-cd frontend
-npm run build
-~~~
-
-也可以使用：
-
-~~~bash
+```bash
 make test
 make race
 make vet
 make build
-# RabbitMQ 已启动时执行集成测试
-make integration
-~~~
+make integration   # 需要 Docker 和 RabbitMQ
+```
 
-日志输出到终端和：
+日志输出到 `logs/api.log` 和 `logs/inference-worker.log`。
 
-~~~text
-logs/api.log
-logs/inference-worker.log
-~~~
+## 项目边界
 
-当前项目仍是本地学习用 MVP。已提供可选 API Key、并发限制、就绪检查、基础指标和匿名会话隔离；生产环境仍应接入正式身份认证、密钥管理、TLS、Prometheus/Grafana 和更完整的消息重试/DLQ 策略。
+这是一个具备生产工程实践的学习型 MVP，重点展示分布式推理网关、Worker Pool、RabbitMQ 调度、Dynamo/SGLang 推理和 SSE。当前没有完整用户登录、JWT、TLS、RabbitMQ DLQ/TTL、Go 服务 Docker 化和压测报告，不建议直接暴露到公网。
