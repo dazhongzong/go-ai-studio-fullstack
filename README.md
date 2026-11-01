@@ -60,21 +60,25 @@ cd middleware/dynamo
 uv sync
 ```
 
-然后启动 Dynamo 依赖的 etcd、NATS、frontend 和 SGLang worker。示例：
+单机开发不需要 Dynamo 源码、etcd 或 NATS。使用 `file` 发现模式启动 frontend 和
+SGLang worker，两个进程必须使用相同的发现模式：
 
 ```bash
-cd /path/to/dynamo
-docker compose -f dev/docker-compose.yml up -d
-
-cd /path/to/go-ai-studio-fullstack/middleware/dynamo
+# 终端 1
 uv run python -m dynamo.frontend \
   --http-port 8000 \
-  --discovery-backend etcd \
-  --router-min-initial-workers 1
-
-CUDA_VISIBLE_DEVICES=0 uv run python -m dynamo.sglang \
-  --model-path Qwen/Qwen3-0.6B
+  --discovery-backend file
 ```
+
+# 终端 2
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python -m dynamo.sglang \
+  --model-path Qwen/Qwen3-0.6B \
+  --discovery-backend file
+```
+
+如果要学习 Dynamo 多节点部署，再额外使用 etcd + NATS，并切换为
+`--discovery-backend etcd`。这时需要单独准备基础设施或获取 Dynamo 源码仓库。
 
 ### 3. 启动项目
 
