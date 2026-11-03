@@ -18,6 +18,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"example.com/go-workerpool-http/internal/auth"
 	"example.com/go-workerpool-http/internal/llm"
 	"example.com/go-workerpool-http/internal/metrics"
 	"example.com/go-workerpool-http/internal/store"
@@ -143,6 +144,7 @@ type Options struct {
 	MaxContextMessages int
 	MaxContextLength   int
 	APIKey             string
+	Auth               *auth.Service
 	Readiness          func(context.Context) error
 	Store              store.ConversationStore
 	Metrics            *metrics.Registry
@@ -185,7 +187,8 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 	if opts.AccessLog {
 		router.Use(logRequests())
 	}
-	protect := requireAPIKey(opts.APIKey)
+	registerAuthRoutes(router, opts.Auth)
+	protect := requireAccess(opts.APIKey, opts.Auth)
 
 	router.NoMethod(func(c *gin.Context) {
 		c.Header("Allow", "GET, POST")
@@ -224,7 +227,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			c.JSON(http.StatusNotImplemented, errorResponse{Error: "conversation store is disabled", RequestID: requestID(c.Request)})
 			return
 		}
-		ownerID, err := requireClientID(c.Request)
+		ownerID, err := ownerIDForRequest(c, opts.Auth, opts.Store != nil)
 		if err != nil {
 			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, time.Now(), 0, err)
 			return
@@ -241,7 +244,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			c.JSON(http.StatusNotImplemented, errorResponse{Error: "conversation store is disabled", RequestID: requestID(c.Request)})
 			return
 		}
-		ownerID, err := requireClientID(c.Request)
+		ownerID, err := ownerIDForRequest(c, opts.Auth, opts.Store != nil)
 		if err != nil {
 			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, time.Now(), 0, err)
 			return
@@ -263,7 +266,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, started, 0, err)
 			return
 		}
-		input.ClientID, err = optionalClientID(c.Request, opts.Store != nil)
+		input.ClientID, err = ownerIDForRequest(c, opts.Auth, opts.Store != nil)
 		if err != nil {
 			writeRequestError(c.Writer, http.StatusBadRequest, c.Request, time.Now(), 0, err)
 			return
@@ -283,6 +286,17 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			return
 		}
 
+		turnID, err := acquireConversationTurn(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, requestID(c.Request), prepared.userPrompt)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, store.ErrConversationBusy) {
+				status = http.StatusConflict
+			}
+			writeRequestError(c.Writer, status, c.Request, started, 0, err)
+			return
+		}
+		defer releaseConversationTurn(prepared.conversationID, input.ClientID, requestID(c.Request), opts.Store)
+
 		ctx, cancel := context.WithTimeout(c.Request.Context(), opts.AskTimeout)
 		defer cancel()
 		delay := time.Duration(input.DelayMS) * time.Millisecond
@@ -290,13 +304,13 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			delay = 100 * time.Millisecond
 		}
 		task := workerpool.Task{ID: taskIDs.Add(1), Prompt: prepared.prompt, Delay: delay}
+		if err := saveUserMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model, turnID); err != nil {
+			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, 0, err)
+			return
+		}
 		reply, err := p.Submit(ctx, task)
 		if err != nil {
 			writeTaskError(c.Writer, c.Request, started, 0, err)
-			return
-		}
-		if err := saveUserMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
-			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, 0, err)
 			return
 		}
 		select {
@@ -305,7 +319,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 				writeTaskError(c.Writer, c.Request, started, result.QueueWait, result.Err)
 				return
 			}
-			if err := saveAssistantMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model); err != nil {
+			if err := saveAssistantMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model, turnID); err != nil {
 				writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, result.QueueWait, err)
 				return
 			}
@@ -512,21 +526,55 @@ func prepareRequestPrompt(ctx context.Context, input askRequest, opts Options) (
 	return preparedRequest{prompt: prompt, conversationID: conversationID, userPrompt: userPrompt, clientID: input.ClientID}, nil
 }
 
-func saveUserMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string) error {
+func acquireConversationTurn(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, taskID, title string) (int64, error) {
+	if conversationStore == nil || conversationID == "" {
+		return 0, nil
+	}
+	ordered, ok := conversationStore.(store.OrderedConversationStore)
+	if !ok {
+		return 0, nil
+	}
+	return ordered.AcquireConversationTurn(ctx, ownerID, conversationID, taskID, title)
+}
+
+func releaseConversationTurn(conversationID, ownerID, taskID string, conversationStore store.ConversationStore) {
+	if conversationStore == nil || conversationID == "" {
+		return
+	}
+	ordered, ok := conversationStore.(store.OrderedConversationStore)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := ordered.ReleaseConversationTurn(ctx, ownerID, conversationID, taskID); err != nil {
+		log.Printf("conversation turn release failed conversation_id=%s task_id=%s: %v", conversationID, taskID, err)
+	}
+}
+
+func saveUserMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string, turnID int64) error {
 	if conversationStore == nil || conversationID == "" || content == "" {
 		return nil
 	}
 	if err := conversationStore.EnsureConversation(ctx, ownerID, conversationID, content); err != nil {
 		return err
 	}
-	return conversationStore.SaveMessage(ctx, ownerID, conversationID, store.Message{Role: "user", Content: content}, requestID, model)
+	message := store.Message{Role: "user", Content: content, TurnID: turnID, MessageOrder: 0}
+	if ordered, ok := conversationStore.(store.OrderedConversationStore); ok && turnID > 0 {
+		return ordered.SaveMessageAtTurn(ctx, ownerID, conversationID, message, requestID, model, turnID, 0)
+	}
+	return conversationStore.SaveMessage(ctx, ownerID, conversationID, message, requestID, model)
 }
 
-func saveAssistantMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string) error {
+func saveAssistantMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string, turnID int64) error {
 	if conversationStore == nil || conversationID == "" || content == "" {
 		return nil
 	}
-	return conversationStore.SaveMessage(ctx, ownerID, conversationID, store.Message{Role: "assistant", Content: content}, requestID, model)
+	message := store.Message{Role: "assistant", Content: content, TurnID: turnID, MessageOrder: 1}
+	if ordered, ok := conversationStore.(store.OrderedConversationStore); ok && turnID > 0 {
+		return ordered.SaveMessageAtTurn(ctx, ownerID, conversationID, message, requestID, model, turnID, 1)
+	}
+	return conversationStore.SaveMessage(ctx, ownerID, conversationID, message, requestID, model)
 }
 
 func writeRequestError(w http.ResponseWriter, status int, r *http.Request, started time.Time, queueWait time.Duration, err error) {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { KeyboardEvent } from 'react'
-import { ask, askStream, getHealth, getInfo, getStats } from './api/client'
-import type { BackendInfo, ChatMessage, PoolStats, RequestMetrics } from './api/client'
+import type { FormEvent, KeyboardEvent, ReactElement } from 'react'
+import { ApiError, ask, askStream, getCurrentUser, getHealth, getInfo, getStats, login, logout, register } from './api/client'
+import type { BackendInfo, ChatMessage, CurrentUser, PoolStats, RequestMetrics } from './api/client'
 
 type Message = {
   id: string
@@ -50,6 +50,57 @@ const initialConversations = storedChats.length
   ? storedChats
   : [{ id: newID(), title: '新对话', createdAt: Date.now(), messages: [] }]
 
+type AuthMode = 'login' | 'register'
+
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: CurrentUser) => void }): ReactElement {
+  const [mode, setMode] = useState<AuthMode>('login')
+  const [loginValue, setLoginValue] = useState('')
+  const [username, setUsername] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault()
+    setError('')
+    setSubmitting(true)
+    try {
+      const user = mode === 'login'
+        ? await login(loginValue, password)
+        : await register(username, email, password)
+      onAuthenticated(user)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '认证失败，请稍后重试')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-card">
+        <div className="auth-logo">G<span>.</span></div>
+        <div className="auth-kicker">GO AI STUDIO</div>
+        <h1>{mode === 'login' ? '登录推理工作台' : '创建账号'}</h1>
+        <p className="auth-intro">登录后，你的会话和聊天记录会安全保存到服务器。</p>
+        <form onSubmit={submit}>
+          {mode === 'register' ? <>
+            <label>用户名<input required minLength={3} maxLength={64} value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" /></label>
+            <label>邮箱<input required type="email" value={email} onChange={event => setEmail(event.target.value)} autoComplete="email" /></label>
+          </> : <label>用户名或邮箱<input required value={loginValue} onChange={event => setLoginValue(event.target.value)} autoComplete="username" /></label>}
+          <label>密码<input required minLength={8} type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} /></label>
+          {error && <div className="auth-error">{error}</div>}
+          <button className="auth-submit" type="submit" disabled={submitting}>{submitting ? '处理中…' : mode === 'login' ? '登录' : '注册并登录'}</button>
+        </form>
+        <button className="auth-switch" type="button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError('') }}>
+          {mode === 'login' ? '还没有账号？立即注册' : '已有账号？返回登录'}
+        </button>
+      </section>
+    </main>
+  )
+}
+
 export default function App() {
   const [chats, setChats] = useState<Conversation[]>(initialConversations)
   const [activeID, setActiveID] = useState(initialConversations[0].id)
@@ -62,6 +113,9 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [notice, setNotice] = useState('')
   const [lastSynced, setLastSynced] = useState<number | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [authEnabled, setAuthEnabled] = useState(false)
+  const [user, setUser] = useState<CurrentUser | null>(null)
   const historyRef = useRef<HTMLDivElement>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -70,10 +124,32 @@ export default function App() {
     () => chats.find(chat => chat.id === activeID) ?? chats[0],
     [activeID, chats],
   )
-  const backendLabel = info?.backend === 'dynamo' ? info.model : 'Mock Backend'
+  const backendLabel = !info
+    ? '后端未连接'
+    : info.backend === 'dynamo'
+      ? (info.model || 'Dynamo')
+      : info.backend === 'mock'
+        ? 'Mock Backend'
+        : info.backend
   const requestModel = info?.model || 'Qwen/Qwen3-0.6B'
   const streamAvailable = info?.streaming === true
   const canSend = Boolean(prompt.trim()) && !isLoading && healthy
+
+  useEffect(() => {
+    let active = true
+    void getCurrentUser().then(result => {
+      if (!active) return
+      setAuthEnabled(result.enabled)
+      setUser(result.user)
+      setAuthLoading(false)
+    }).catch(() => {
+      if (!active) return
+      // The health indicator still explains an unavailable backend. Do not
+      // trap the user on a login screen when auth discovery itself failed.
+      setAuthLoading(false)
+    })
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     try {
@@ -161,6 +237,12 @@ export default function App() {
     }
   }
 
+  async function signOut(): Promise<void> {
+    await logout()
+    setUser(null)
+    setAuthEnabled(true)
+  }
+
   function stopGeneration(): void {
     controllerRef.current?.abort()
   }
@@ -233,6 +315,10 @@ export default function App() {
           content: answerContent || '生成已取消。',
         }))
       } else {
+        if (error instanceof ApiError && error.status === 401 && authEnabled) {
+          setUser(null)
+          flash('登录状态已失效，请重新登录')
+        }
         const message = error instanceof Error ? error.message : '未知错误'
         updateMessage(chatID, answer.id, current => ({
           ...current,
@@ -258,6 +344,13 @@ export default function App() {
   function fillExample(text: string): void {
     setPrompt(text)
     window.setTimeout(() => document.querySelector<HTMLTextAreaElement>('.prompt-input')?.focus(), 0)
+  }
+
+  if (authLoading) {
+    return <main className="auth-shell"><div className="auth-loading">正在检查登录状态…</div></main>
+  }
+  if (authEnabled && !user) {
+    return <AuthScreen onAuthenticated={nextUser => setUser(nextUser)} />
   }
 
   return (
@@ -304,6 +397,7 @@ export default function App() {
             <div className="model-pill"><span className="model-dot" /><span>{backendLabel}</span></div>
             <span className="topbar-separator" />
             <div className={`health-pill${healthy ? '' : ' offline'}`}><span className="health-dot" />{healthy ? '服务运行中' : '服务未连接'}</div>
+            {user && <div className="user-menu"><span>{user.username}</span><button type="button" onClick={() => void signOut()}>退出</button></div>}
           </div>
         </header>
 

@@ -1,4 +1,4 @@
-.PHONY: test race vet integration frontend build run run-mock infra-up infra-down docker-build docker-up docker-down docker-logs
+.PHONY: test race vet integration frontend build run run-mock dev-up dev-backend dev-frontend infra-up infra-down docker-build docker-up docker-down docker-logs
 
 test:
 	go test ./backend/...
@@ -26,6 +26,15 @@ run:
 
 run-mock:
 	BACKEND=mock go run ./backend/cmd/server
+
+dev-up:
+	bash ./scripts/dev-up.sh
+
+dev-backend:
+	bash ./scripts/dev-backend.sh
+
+dev-frontend:
+	bash ./scripts/dev-frontend.sh
 
 infra-up:
 	docker compose -f middleware/docker-compose.yml up -d mysql rabbitmq

@@ -23,7 +23,7 @@ Nginx:8088 ──▶ Go API api-1/api-2
           │
    Dynamo / SGLang ──▶ GPU
 
-MySQL：会话和消息持久化
+MySQL：用户、登录会话、聊天会话和消息持久化
 etcd + NATS：Dynamo 服务发现和事件通信
 ```
 
@@ -107,6 +107,34 @@ DOCKER_DYNAMO_URL=http://host.docker.internal:8000
 
 ## 本地开发
 
+### 一键启动完整本地链路
+
+确保已安装 Docker、Go、Node.js、uv，并准备好 GPU 驱动后，在项目根目录执行：
+
+```bash
+cp .env.example .env
+make dev-up
+```
+
+脚本会启动 MySQL、RabbitMQ、Dynamo frontend、SGLang worker、Go API、
+inference-worker 和 React Vite。按 `Ctrl+C` 会停止本地进程及 MySQL/RabbitMQ
+容器，但保留 Docker 数据卷。日志位于 `logs/`。
+
+也可以前后端分离启动：
+
+```bash
+# 终端 1：MySQL、RabbitMQ、Dynamo、Go API、inference-worker
+make dev-backend
+
+# 终端 2：React Vite 热重载
+make dev-frontend
+```
+
+如果只想运行 Mock 后端，将 `.env` 中的 `BACKEND` 改成 `mock`，并清空
+`QUEUE_URL`、`MYSQL_DSN`；脚本会跳过 inference-worker，但仍会启动 Dynamo 进程。
+
+### 分终端启动
+
 ```bash
 cp .env.example .env
 docker compose -f middleware/docker-compose.yml up -d mysql rabbitmq
@@ -153,7 +181,46 @@ curl http://127.0.0.1:8088/api/v1/chat/completions \
 | DELETE | `/api/conversations/:id` | 删除会话 |
 | POST | `/api/v1/chat/completions` | OpenAI-compatible 推理接口 |
 
-配置 `API_KEY` 后，使用以下请求头鉴权：
+配置 `AUTH_JWT_SECRET`（至少 32 个字符）后启用用户系统：
+
+```bash
+AUTH_JWT_SECRET=$(openssl rand -base64 32)
+```
+
+```text
+POST /api/auth/register   注册并返回 Access/Refresh Token
+POST /api/auth/login      登录
+POST /api/auth/refresh    轮换 Refresh Token
+POST /api/auth/logout     注销登录会话
+GET  /api/auth/me         获取当前用户
+```
+
+业务请求使用：
+
+```text
+Authorization: Bearer <access_token>
+```
+
+Access Token 默认 15 分钟，Refresh Token 默认 30 天。每个用户可以拥有多个
+登录会话；聊天会话通过 `conversation_id` 归属于登录用户。未配置
+`AUTH_JWT_SECRET` 时，本地兼容使用 `X-Client-ID`，不适合生产环境。
+
+快速验证用户系统：
+
+```bash
+curl -s http://127.0.0.1:8088/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","email":"alice@example.com","password":"password123"}'
+
+curl -s http://127.0.0.1:8088/api/auth/me \
+  -H 'Authorization: Bearer <access_token>'
+```
+
+启用 MySQL 用户认证后，同一个 `conversation_id` 同时只允许一个推理任务，
+服务端使用 MySQL 行锁分配 `turn_id`；不同会话仍可并行执行。消息按
+`turn_id` 和 `message_order` 读取，不依赖 HTTP 连接或 RabbitMQ 的投递顺序。
+
+配置 `API_KEY` 后，也可以使用以下请求头进行服务级鉴权：
 
 ```text
 Authorization: Bearer <API_KEY>
@@ -181,5 +248,5 @@ Docker：logs/api-1/、logs/api-2/、logs/worker-1/
 ## 当前边界
 
 这是一个学习型生产工程 MVP，已经具备 Docker Compose、RabbitMQ RPC、Worker Pool、
-Dynamo/SGLang、SSE、MySQL 会话和基础可观测性。尚未包含完整用户系统、JWT、TLS、
+ Dynamo/SGLang、SSE、MySQL 用户/登录会话/聊天会话和基础可观测性。尚未包含 TLS、
 RabbitMQ TTL/DLQ 和正式压测报告，不建议直接暴露到公网。

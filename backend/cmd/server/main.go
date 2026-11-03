@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"example.com/go-workerpool-http/internal/api"
+	"example.com/go-workerpool-http/internal/auth"
 	"example.com/go-workerpool-http/internal/config"
 	"example.com/go-workerpool-http/internal/dynamo"
 	"example.com/go-workerpool-http/internal/logging"
@@ -72,6 +73,26 @@ func main() {
 		defer conversationStore.Close()
 		opts.Store = conversationStore
 		log.Println("mysql conversation store enabled")
+	}
+	var authService *auth.Service
+	if conversationStore != nil {
+		if secret := strings.TrimSpace(os.Getenv("AUTH_JWT_SECRET")); secret != "" {
+			authService, err = auth.New(
+				conversationStore,
+				secret,
+				durationEnv("ACCESS_TOKEN_TTL", 15*time.Minute),
+				durationEnv("REFRESH_TOKEN_TTL", 30*24*time.Hour),
+			)
+			if err != nil {
+				log.Fatal(err)
+			}
+			opts.Auth = authService
+			log.Println("user authentication enabled")
+		} else {
+			log.Println("user authentication disabled: AUTH_JWT_SECRET is not configured; using X-Client-ID compatibility mode")
+		}
+	} else if strings.TrimSpace(os.Getenv("AUTH_JWT_SECRET")) != "" {
+		log.Println("AUTH_JWT_SECRET is set but MYSQL_DSN is empty; user authentication disabled")
 	}
 	var dynamoClient *dynamo.Client
 	switch backend {

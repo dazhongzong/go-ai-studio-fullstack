@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"example.com/go-workerpool-http/internal/llm"
+	"example.com/go-workerpool-http/internal/store"
 	"example.com/go-workerpool-http/workerpool"
 )
 
@@ -75,7 +76,7 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 			ConversationID: input.ConversationID,
 			Messages:       input.Messages,
 		}
-		requestInput.ClientID, err = optionalClientID(c.Request, opts.Store != nil)
+		requestInput.ClientID, err = ownerIDForRequest(c, opts.Auth, opts.Store != nil)
 		if err != nil {
 			writeOpenAIError(c.Writer, http.StatusBadRequest, err)
 			return
@@ -90,9 +91,19 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 			writeOpenAIError(c.Writer, status, err)
 			return
 		}
+		turnID, err := acquireConversationTurn(c.Request.Context(), opts.Store, requestInput.ClientID, prepared.conversationID, requestID(c.Request), prepared.userPrompt)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, store.ErrConversationBusy) {
+				status = http.StatusConflict
+			}
+			writeOpenAIError(c.Writer, status, err)
+			return
+		}
+		defer releaseConversationTurn(prepared.conversationID, requestInput.ClientID, requestID(c.Request), opts.Store)
 
 		if input.Stream {
-			handleOpenAIStream(c, prepared, opts)
+			handleOpenAIStream(c, prepared, opts, turnID)
 			return
 		}
 
@@ -103,13 +114,13 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 			Prompt: prepared.prompt,
 			Delay:  100 * time.Millisecond,
 		}
+		if err := saveUserMessage(c.Request.Context(), opts.Store, requestInput.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model, turnID); err != nil {
+			writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
+			return
+		}
 		reply, err := p.Submit(ctx, task)
 		if err != nil {
 			writeOpenAIError(c.Writer, taskErrorStatus(err), err)
-			return
-		}
-		if err := saveUserMessage(c.Request.Context(), opts.Store, requestInput.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
-			writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
 			return
 		}
 
@@ -119,7 +130,7 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 				writeOpenAIError(c.Writer, taskErrorStatus(result.Err), result.Err)
 				return
 			}
-			if err := saveAssistantMessage(c.Request.Context(), opts.Store, requestInput.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model); err != nil {
+			if err := saveAssistantMessage(c.Request.Context(), opts.Store, requestInput.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model, turnID); err != nil {
 				writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
 				return
 			}
@@ -141,7 +152,7 @@ func openAIChatCompletionsHandler(p *workerpool.Pool, opts Options, taskIDs *ato
 	}
 }
 
-func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) {
+func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options, turnID int64) {
 	if opts.Streamer == nil {
 		writeOpenAIError(c.Writer, http.StatusServiceUnavailable, errors.New("streaming is not enabled"))
 		return
@@ -154,7 +165,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 			opts.Metrics.StreamFinished(time.Since(streamStarted), streamFailed)
 		}()
 	}
-	if err := saveUserMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model); err != nil {
+	if err := saveUserMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model, turnID); err != nil {
 		streamFailed = true
 		writeOpenAIError(c.Writer, http.StatusInternalServerError, err)
 		return
@@ -211,7 +222,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 		}
 		if chunk.Done {
 			finished = true
-			if err := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model); err != nil {
+			if err := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model, turnID); err != nil {
 				return err
 			}
 			finishReason := "stop"
@@ -223,7 +234,7 @@ func handleOpenAIStream(c *gin.Context, prepared preparedRequest, opts Options) 
 		return nil
 	})
 	if err == nil && !finished {
-		if saveErr := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model); saveErr != nil {
+		if saveErr := saveAssistantMessage(c.Request.Context(), opts.Store, prepared.clientID, prepared.conversationID, assistant.String(), requestID(c.Request), opts.Model, turnID); saveErr != nil {
 			err = saveErr
 		} else {
 			finishReason := "stop"
