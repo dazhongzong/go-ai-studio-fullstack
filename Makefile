@@ -37,7 +37,7 @@ dev-frontend:
 	bash ./scripts/dev-frontend.sh
 
 infra-up:
-	docker compose -f middleware/docker-compose.yml up -d mysql rabbitmq
+	docker compose -f middleware/docker-compose.yml up -d mysql rabbitmq redis
 
 infra-down:
 	docker compose -f middleware/docker-compose.yml down

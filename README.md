@@ -24,6 +24,7 @@ Nginx:8088 ──▶ Go API api-1/api-2
    Dynamo / SGLang ──▶ GPU
 
 MySQL：用户、登录会话、聊天会话和消息持久化
+Redis：多 API 实例全局限流和聊天历史短缓存
 etcd + NATS：Dynamo 服务发现和事件通信
 ```
 
@@ -89,7 +90,7 @@ make docker-up
 curl http://127.0.0.1:8088/api/readyz
 ```
 
-Compose 会启动：Nginx、两个 Go API、inference-worker、RabbitMQ 和 MySQL。
+Compose 会启动：Nginx、两个 Go API、inference-worker、RabbitMQ、Redis 和 MySQL。
 
 ```bash
 make docker-logs    # 查看日志
@@ -102,7 +103,7 @@ Docker 中 Dynamo 地址由 `DOCKER_DYNAMO_URL` 配置，默认是：
 DOCKER_DYNAMO_URL=http://host.docker.internal:8000
 ```
 
-容器之间使用服务名通信，例如 `mysql:3306`、`rabbitmq:5672`，不要使用容器内的
+容器之间使用服务名通信，例如 `mysql:3306`、`rabbitmq:5672`、`redis:6379`，不要使用容器内的
 `127.0.0.1`。
 
 ## 本地开发
@@ -116,9 +117,12 @@ cp .env.example .env
 make dev-up
 ```
 
-脚本会启动 MySQL、RabbitMQ、Dynamo frontend、SGLang worker、Go API、
-inference-worker 和 React Vite。按 `Ctrl+C` 会停止本地进程及 MySQL/RabbitMQ
+脚本会启动 MySQL、RabbitMQ、Redis、Dynamo frontend、SGLang worker、Go API、
+inference-worker 和 React Vite。按 `Ctrl+C` 会停止本地进程及 MySQL/RabbitMQ/Redis
 容器，但保留 Docker 数据卷。日志位于 `logs/`。
+
+Redis 默认用于跨 API 实例的全局推理并发限制和聊天历史短缓存；Redis 暂时不可用时，
+聊天历史回退到 MySQL，本地 `MAX_IN_FLIGHT` 限流仍然生效。
 
 也可以前后端分离启动：
 

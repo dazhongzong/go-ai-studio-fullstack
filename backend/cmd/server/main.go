@@ -18,6 +18,7 @@ import (
 
 	"example.com/go-workerpool-http/internal/api"
 	"example.com/go-workerpool-http/internal/auth"
+	"example.com/go-workerpool-http/internal/cache"
 	"example.com/go-workerpool-http/internal/config"
 	"example.com/go-workerpool-http/internal/dynamo"
 	"example.com/go-workerpool-http/internal/logging"
@@ -51,6 +52,7 @@ func main() {
 	maxContextMessages := envInt("MAX_CONTEXT_MESSAGES", api.DefaultMaxContextMessages)
 	maxContextLength := envInt("MAX_CONTEXT_LENGTH", api.DefaultMaxContextLength)
 	maxInFlight := envInt("MAX_IN_FLIGHT", 8)
+	globalMaxInFlight := envInt("GLOBAL_MAX_IN_FLIGHT", 16)
 	poolWorkers := envInt("POOL_WORKERS", 3)
 	poolQueueSize := envInt("POOL_QUEUE_SIZE", 5)
 	requestMetrics := metrics.New()
@@ -60,8 +62,24 @@ func main() {
 		StreamTimeout: 2 * time.Minute, AccessLog: true,
 		Model: model, MaxPromptLength: maxPromptLength,
 		MaxContextMessages: maxContextMessages, MaxContextLength: maxContextLength,
-		APIKey:  strings.TrimSpace(os.Getenv("API_KEY")),
-		Metrics: requestMetrics,
+		APIKey:            strings.TrimSpace(os.Getenv("API_KEY")),
+		GlobalMaxInFlight: globalMaxInFlight,
+		GlobalLimitTTL:    durationEnv("GLOBAL_LIMIT_TTL", 5*time.Minute),
+		Metrics:           requestMetrics,
+	}
+	var redisClient *cache.Redis
+	redisEnabled := !strings.EqualFold(strings.TrimSpace(os.Getenv("REDIS_ENABLED")), "false")
+	if redisEnabled {
+		redisURL := envString("REDIS_URL", "redis://127.0.0.1:6379/0")
+		redisClient, err = cache.New(redisURL, envInt("REDIS_POOL_SIZE", 16), envInt("REDIS_MIN_IDLE_CONNS", 4))
+		if err != nil {
+			log.Printf("redis disabled: %v", err)
+		} else {
+			defer redisClient.Close()
+			opts.Cache = redisClient
+			opts.GlobalLimiter = redisClient
+			log.Printf("redis enabled url=%s pool_size=%d global_max_in_flight=%d", redisURL, envInt("REDIS_POOL_SIZE", 16), globalMaxInFlight)
+		}
 	}
 	var conversationStore *store.MySQLStore
 	if dsn := strings.TrimSpace(os.Getenv("MYSQL_DSN")); dsn != "" {
@@ -136,6 +154,11 @@ func main() {
 		if conversationStore != nil {
 			if err := conversationStore.Ping(ctx); err != nil {
 				return fmt.Errorf("mysql is not ready: %w", err)
+			}
+		}
+		if redisClient != nil && globalMaxInFlight > 0 {
+			if err := redisClient.Ping(ctx); err != nil {
+				return fmt.Errorf("redis is not ready: %w", err)
 			}
 		}
 		return nil

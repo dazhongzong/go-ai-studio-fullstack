@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"example.com/go-workerpool-http/internal/auth"
+	"example.com/go-workerpool-http/internal/cache"
 	"example.com/go-workerpool-http/internal/llm"
 	"example.com/go-workerpool-http/internal/metrics"
 	"example.com/go-workerpool-http/internal/store"
@@ -145,6 +146,10 @@ type Options struct {
 	MaxContextLength   int
 	APIKey             string
 	Auth               *auth.Service
+	Cache              cache.Store
+	GlobalLimiter      cache.ConcurrencyLimiter
+	GlobalMaxInFlight  int
+	GlobalLimitTTL     time.Duration
 	Readiness          func(context.Context) error
 	Store              store.ConversationStore
 	Metrics            *metrics.Registry
@@ -257,9 +262,10 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, time.Now(), 0, err)
 			return
 		}
+		invalidateConversationMessages(c.Request.Context(), opts.Cache, ownerID, c.Param("id"))
 		c.Status(http.StatusNoContent)
 	})
-	router.POST("/ask", protect, limitAsk(opts.MaxInFlight), func(c *gin.Context) {
+	router.POST("/ask", protect, globalLimit(opts.GlobalLimiter, opts.GlobalMaxInFlight, opts.GlobalLimitTTL), limitAsk(opts.MaxInFlight), func(c *gin.Context) {
 		started := time.Now()
 		input, err := decodeAskInput(c.Writer, c.Request)
 		if err != nil {
@@ -304,7 +310,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			delay = 100 * time.Millisecond
 		}
 		task := workerpool.Task{ID: taskIDs.Add(1), Prompt: prepared.prompt, Delay: delay}
-		if err := saveUserMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model, turnID); err != nil {
+		if err := saveUserMessage(c.Request.Context(), opts.Store, opts.Cache, input.ClientID, prepared.conversationID, prepared.userPrompt, requestID(c.Request), opts.Model, turnID); err != nil {
 			writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, 0, err)
 			return
 		}
@@ -319,7 +325,7 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 				writeTaskError(c.Writer, c.Request, started, result.QueueWait, result.Err)
 				return
 			}
-			if err := saveAssistantMessage(c.Request.Context(), opts.Store, input.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model, turnID); err != nil {
+			if err := saveAssistantMessage(c.Request.Context(), opts.Store, opts.Cache, input.ClientID, prepared.conversationID, result.Output, requestID(c.Request), opts.Model, turnID); err != nil {
 				writeRequestError(c.Writer, http.StatusInternalServerError, c.Request, started, result.QueueWait, err)
 				return
 			}
@@ -332,8 +338,41 @@ func NewHandlerWithOptions(p *workerpool.Pool, opts Options) http.Handler {
 			writeTaskError(c.Writer, c.Request, started, 0, ctx.Err())
 		}
 	})
-	router.POST("/v1/chat/completions", protect, limitAsk(opts.MaxInFlight), openAIChatCompletionsHandler(p, opts, &taskIDs))
+	router.POST("/v1/chat/completions", protect, globalLimit(opts.GlobalLimiter, opts.GlobalMaxInFlight, opts.GlobalLimitTTL), limitAsk(opts.MaxInFlight), openAIChatCompletionsHandler(p, opts, &taskIDs))
 	return router
+}
+
+func globalLimit(limiter cache.ConcurrencyLimiter, maxConcurrent int, ttl time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if limiter == nil || maxConcurrent <= 0 {
+			c.Next()
+			return
+		}
+		const key = "gateway:inference:inflight"
+		allowed, err := limiter.Acquire(c.Request.Context(), key, maxConcurrent, ttl)
+		if err != nil {
+			// Redis is an optimization and a cross-instance guard. Keep the API
+			// available and let the local limiter protect this process if Redis
+			// is temporarily unavailable.
+			log.Printf("redis global limiter unavailable: %v", err)
+			c.Next()
+			return
+		}
+		if !allowed {
+			c.Header("Retry-After", "1")
+			writeRequestError(c.Writer, http.StatusTooManyRequests, c.Request, time.Now(), 0, errors.New("too many global concurrent requests"))
+			c.Abort()
+			return
+		}
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := limiter.Release(releaseCtx, key); err != nil {
+				log.Printf("redis global limiter release failed: %v", err)
+			}
+		}()
+		c.Next()
+	}
 }
 
 func requireAPIKey(expected string) gin.HandlerFunc {
@@ -510,7 +549,7 @@ func prepareRequestPrompt(ctx context.Context, input askRequest, opts Options) (
 	if err := validatePrompt(userPrompt, opts.MaxPromptLength); err != nil {
 		return preparedRequest{}, err
 	}
-	history, err := opts.Store.LoadMessages(ctx, input.ClientID, conversationID, opts.MaxContextMessages-1)
+	history, err := loadConversationMessages(ctx, opts.Store, opts.Cache, input.ClientID, conversationID, opts.MaxContextMessages-1)
 	if err != nil {
 		return preparedRequest{}, &persistenceError{err: err}
 	}
@@ -552,7 +591,7 @@ func releaseConversationTurn(conversationID, ownerID, taskID string, conversatio
 	}
 }
 
-func saveUserMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string, turnID int64) error {
+func saveUserMessage(ctx context.Context, conversationStore store.ConversationStore, messageCache cache.Store, ownerID, conversationID, content, requestID, model string, turnID int64) error {
 	if conversationStore == nil || conversationID == "" || content == "" {
 		return nil
 	}
@@ -560,21 +599,77 @@ func saveUserMessage(ctx context.Context, conversationStore store.ConversationSt
 		return err
 	}
 	message := store.Message{Role: "user", Content: content, TurnID: turnID, MessageOrder: 0}
+	var err error
 	if ordered, ok := conversationStore.(store.OrderedConversationStore); ok && turnID > 0 {
-		return ordered.SaveMessageAtTurn(ctx, ownerID, conversationID, message, requestID, model, turnID, 0)
+		err = ordered.SaveMessageAtTurn(ctx, ownerID, conversationID, message, requestID, model, turnID, 0)
+	} else {
+		err = conversationStore.SaveMessage(ctx, ownerID, conversationID, message, requestID, model)
 	}
-	return conversationStore.SaveMessage(ctx, ownerID, conversationID, message, requestID, model)
+	if err == nil {
+		invalidateConversationMessages(ctx, messageCache, ownerID, conversationID)
+	}
+	return err
 }
 
-func saveAssistantMessage(ctx context.Context, conversationStore store.ConversationStore, ownerID, conversationID, content, requestID, model string, turnID int64) error {
+func saveAssistantMessage(ctx context.Context, conversationStore store.ConversationStore, messageCache cache.Store, ownerID, conversationID, content, requestID, model string, turnID int64) error {
 	if conversationStore == nil || conversationID == "" || content == "" {
 		return nil
 	}
 	message := store.Message{Role: "assistant", Content: content, TurnID: turnID, MessageOrder: 1}
+	var err error
 	if ordered, ok := conversationStore.(store.OrderedConversationStore); ok && turnID > 0 {
-		return ordered.SaveMessageAtTurn(ctx, ownerID, conversationID, message, requestID, model, turnID, 1)
+		err = ordered.SaveMessageAtTurn(ctx, ownerID, conversationID, message, requestID, model, turnID, 1)
+	} else {
+		err = conversationStore.SaveMessage(ctx, ownerID, conversationID, message, requestID, model)
 	}
-	return conversationStore.SaveMessage(ctx, ownerID, conversationID, message, requestID, model)
+	if err == nil {
+		invalidateConversationMessages(ctx, messageCache, ownerID, conversationID)
+	}
+	return err
+}
+
+func conversationMessagesCacheKey(ownerID, conversationID string) string {
+	return "conversation:v1:" + ownerID + ":" + conversationID + ":messages"
+}
+
+func loadConversationMessages(ctx context.Context, conversationStore store.ConversationStore, messageCache cache.Store, ownerID, conversationID string, limit int) ([]store.Message, error) {
+	if messageCache != nil {
+		if value, err := messageCache.Get(ctx, conversationMessagesCacheKey(ownerID, conversationID)); err == nil && value != nil {
+			var messages []store.Message
+			if err := json.Unmarshal(value, &messages); err == nil {
+				if len(messages) > limit {
+					messages = messages[len(messages)-limit:]
+				}
+				return messages, nil
+			} else {
+				log.Printf("redis conversation cache decode failed conversation_id=%s: %v", conversationID, err)
+			}
+		} else if err != nil {
+			log.Printf("redis conversation cache read failed conversation_id=%s: %v", conversationID, err)
+		}
+	}
+
+	messages, err := conversationStore.LoadMessages(ctx, ownerID, conversationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	if messageCache != nil {
+		if value, marshalErr := json.Marshal(messages); marshalErr == nil {
+			if setErr := messageCache.Set(ctx, conversationMessagesCacheKey(ownerID, conversationID), value, time.Minute); setErr != nil {
+				log.Printf("redis conversation cache write failed conversation_id=%s: %v", conversationID, setErr)
+			}
+		}
+	}
+	return messages, nil
+}
+
+func invalidateConversationMessages(ctx context.Context, messageCache cache.Store, ownerID, conversationID string) {
+	if messageCache == nil {
+		return
+	}
+	if err := messageCache.Delete(ctx, conversationMessagesCacheKey(ownerID, conversationID)); err != nil {
+		log.Printf("redis conversation cache invalidation failed conversation_id=%s: %v", conversationID, err)
+	}
 }
 
 func writeRequestError(w http.ResponseWriter, status int, r *http.Request, started time.Time, queueWait time.Duration, err error) {

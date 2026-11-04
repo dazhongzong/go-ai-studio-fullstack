@@ -11,6 +11,12 @@ x-common-env: &common-env
   QUEUE_URL: amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
   QUEUE_RETRY_INTERVAL: ${QUEUE_RETRY_INTERVAL:-2s}
   MYSQL_DSN: root:${MYSQL_ROOT_PASSWORD:-root}@tcp(mysql:3306)/${MYSQL_DATABASE:-go_ai_studio}?parseTime=true
+  REDIS_URL: redis://redis:6379/0
+  REDIS_ENABLED: ${REDIS_ENABLED:-true}
+  REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-16}
+  REDIS_MIN_IDLE_CONNS: ${REDIS_MIN_IDLE_CONNS:-4}
+  GLOBAL_MAX_IN_FLIGHT: ${GLOBAL_MAX_IN_FLIGHT:-16}
+  GLOBAL_LIMIT_TTL: ${GLOBAL_LIMIT_TTL:-5m}
   API_KEY: ${API_KEY:-}
   AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
   ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
@@ -59,6 +65,20 @@ services:
       timeout: 5s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - go_ai_redis:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   api-1:
     build:
       <<: *go-build
@@ -81,6 +101,8 @@ services:
       mysql:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/livez"]
@@ -111,6 +133,8 @@ services:
       mysql:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/livez"]
@@ -152,3 +176,4 @@ services:
 volumes:
   go_ai_mysql:
   go_ai_rabbitmq:
+  go_ai_redis:

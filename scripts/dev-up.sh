@@ -177,8 +177,8 @@ stop_all() {
     wait "${pid}" >/dev/null 2>&1 || true
   done
   if (( INFRA_STARTED == 1 )); then
-    log "停止 MySQL 和 RabbitMQ 容器（数据卷保留）"
-    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop mysql rabbitmq >/dev/null 2>&1 || true
+    log "停止 MySQL、RabbitMQ 和 Redis 容器（数据卷保留）"
+    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop mysql rabbitmq redis >/dev/null 2>&1 || true
   fi
   log "所有本地服务已停止"
 }
@@ -199,13 +199,15 @@ if [[ "${BACKEND}" != "dynamo" ]]; then
   log "警告：当前 BACKEND=${BACKEND}，Dynamo 会启动，但 Go API 不会使用 Dynamo。"
 fi
 
-log "启动 MySQL 和 RabbitMQ"
-docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d mysql rabbitmq
+log "启动 MySQL、RabbitMQ 和 Redis"
+docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d mysql rabbitmq redis
 INFRA_STARTED=1
 wait_for_tcp 127.0.0.1 3306 MySQL 90 || die "MySQL 启动超时"
 wait_for_tcp 127.0.0.1 5672 RabbitMQ 90 || die "RabbitMQ 启动超时"
+wait_for_tcp 127.0.0.1 6379 Redis 90 || die "Redis 启动超时"
 wait_for_container_health mysql MySQL 90 || die "MySQL 健康检查失败"
 wait_for_container_health rabbitmq RabbitMQ 90 || die "RabbitMQ 健康检查失败"
+wait_for_container_health redis Redis 90 || die "Redis 健康检查失败"
 
 if [[ ! -x "${DYNAMO_DIR}/.venv/bin/python" ]]; then
   log "Dynamo 虚拟环境不存在，执行 uv sync"
