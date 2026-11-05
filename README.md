@@ -1,169 +1,107 @@
 # Go AI Studio
 
-基于 Go/Gin、RabbitMQ、NVIDIA Dynamo/SGLang 和 React 的分布式 LLM 推理网关。
-项目重点：请求路由、Worker Pool、消息队列、SSE、多实例部署和会话持久化。
+基于 Go 的 OpenAI-compatible LLM 推理网关，支持普通推理、SSE 流式响应、多轮会话、用户认证和多实例部署。
+
+## 演示
+
+![Go AI Studio 演示](assets/demo.gif)
 
 ## 架构
 
 ```text
-React / OpenAI SDK
-        │ HTTP / SSE
-        ▼
-Nginx:8088 ──▶ Go API api-1/api-2
-                    │
-          ┌─────────┴─────────┐
-          │                   │
-      stream=false        stream=true
-          │                   │
-      Worker Pool        Dynamo SSE
-          │                   │
-      RabbitMQ             │
-          │                   │
-   inference-worker ───────┘
+Client
+  │ HTTP / SSE
+  ▼
+Nginx → Go API × 2
           │
-   Dynamo / SGLang ──▶ GPU
+          ├─ stream=false → Worker Pool → RabbitMQ → inference-worker → Dynamo/SGLang
+          │
+          └─ stream=true  → Dynamo/SGLang → SSE
 
-MySQL：用户、登录会话、聊天会话和消息持久化
-Redis：多 API 实例全局限流和聊天历史短缓存
-etcd + NATS：Dynamo 服务发现和事件通信
+MySQL：用户、会话、消息和登录 Session
+Redis：跨实例限流和聊天历史缓存
 ```
 
-- 非流式请求：Go API → Worker Pool → RabbitMQ → inference-worker → Dynamo。
-- 流式请求：Go API 直接连接 Dynamo，返回 OpenAI-compatible SSE。
-- MySQL 保存会话历史，`X-Client-ID` 用于匿名会话隔离。
+- 普通请求通过 Worker Pool 和 RabbitMQ 解耦 API 与模型推理。
+- 流式请求直连 Dynamo/SGLang，避免逐 Token 经过消息队列。
+- MySQL 使用事务、行锁和 `turn_id` 保证同一会话的消息顺序。
 
 ## 目录
 
 ```text
-backend/                 Go API、Worker 和业务代码
-backend/Dockerfile       生产镜像构建文件
-frontend/                React + TypeScript + Vite
-middleware/              Compose、Nginx、MySQL、RabbitMQ、Dynamo 配置
-Makefile                 测试、构建和部署命令
+backend/       Go API、Worker Pool、RabbitMQ、Dynamo 客户端和业务代码
+frontend/      React + TypeScript 前端
+middleware/    Docker Compose、Nginx、MySQL、RabbitMQ、Redis、Dynamo 配置
+scripts/       本地一键启动脚本
 ```
 
-## Docker 启动
+## 快速启动
 
-### 1. 配置
+依赖：Go、Docker、Node.js、npm、uv；使用真实模型还需要 NVIDIA GPU 环境。
 
-```bash
-cp .env.docker.example .env
-```
-
-没有 Dynamo 时，将 `.env` 中的 `BACKEND` 改成 `mock`，可先验证完整网关链路。
-
-### 2. 启动真实模型
-
-Dynamo/SGLang 使用 GPU，当前作为宿主机服务运行：
-
-```bash
-cd middleware/dynamo
-uv sync
-```
-
-单机开发不需要 Dynamo 源码、etcd 或 NATS。使用 `file` 发现模式启动 frontend 和
-SGLang worker，两个进程必须使用相同的发现模式：
-
-```bash
-# 终端 1
-uv run python -m dynamo.frontend \
-  --http-port 8000 \
-  --discovery-backend file
-```
-
-# 终端 2
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run python -m dynamo.sglang \
-  --model-path Qwen/Qwen3-0.6B \
-  --discovery-backend file
-```
-
-如果要学习 Dynamo 多节点部署，再额外使用 etcd + NATS，并切换为
-`--discovery-backend etcd`。这时需要单独准备基础设施或获取 Dynamo 源码仓库。
-
-### 3. 启动项目
-
-在仓库根目录执行：
-
-```bash
-make docker-up
-curl http://127.0.0.1:8088/api/readyz
-```
-
-Compose 会启动：Nginx、两个 Go API、inference-worker、RabbitMQ、Redis 和 MySQL。
-
-```bash
-make docker-logs    # 查看日志
-make docker-down    # 停止服务，保留数据卷
-```
-
-Docker 中 Dynamo 地址由 `DOCKER_DYNAMO_URL` 配置，默认是：
-
-```env
-DOCKER_DYNAMO_URL=http://host.docker.internal:8000
-```
-
-容器之间使用服务名通信，例如 `mysql:3306`、`rabbitmq:5672`、`redis:6379`，不要使用容器内的
-`127.0.0.1`。
-
-## 本地开发
-
-### 一键启动完整本地链路
-
-确保已安装 Docker、Go、Node.js、uv，并准备好 GPU 驱动后，在项目根目录执行：
+### 本地开发
 
 ```bash
 cp .env.example .env
 make dev-up
 ```
 
-脚本会启动 MySQL、RabbitMQ、Redis、Dynamo frontend、SGLang worker、Go API、
-inference-worker 和 React Vite。按 `Ctrl+C` 会停止本地进程及 MySQL/RabbitMQ/Redis
-容器，但保留 Docker 数据卷。日志位于 `logs/`。
+脚本会启动 MySQL、RabbitMQ、Redis、Dynamo、Go API、inference-worker 和 React Vite。
+日志位于 `logs/`，按 `Ctrl+C` 停止服务。
 
-Redis 默认用于跨 API 实例的全局推理并发限制和聊天历史短缓存；Redis 暂时不可用时，
-聊天历史回退到 MySQL，本地 `MAX_IN_FLIGHT` 限流仍然生效。
+访问地址：
 
-也可以前后端分离启动：
-
-```bash
-# 终端 1：MySQL、RabbitMQ、Dynamo、Go API、inference-worker
-make dev-backend
-
-# 终端 2：React Vite 热重载
-make dev-frontend
+```text
+前端：http://127.0.0.1:5173
+Go API：http://127.0.0.1:18080
+Dynamo：http://127.0.0.1:8000
 ```
 
-如果只想运行 Mock 后端，将 `.env` 中的 `BACKEND` 改成 `mock`，并清空
-`QUEUE_URL`、`MYSQL_DSN`；脚本会跳过 inference-worker，但仍会启动 Dynamo 进程。
-
-### 分终端启动
+前后端分开启动：
 
 ```bash
-cp .env.example .env
-docker compose -f middleware/docker-compose.yml up -d mysql rabbitmq
+make dev-backend
+make dev-frontend   # 另一个终端执行
+```
+
+### Docker 部署
+
+先启动宿主机上的 Dynamo frontend 和 SGLang worker：
+
+```bash
+cd middleware/dynamo
+uv sync
 
 # 终端 1
-go run ./backend/cmd/server
+uv run python -m dynamo.frontend --http-port 8000 --discovery-backend file
 
 # 终端 2
-WORKER_ID=worker-1 go run ./backend/cmd/inference-worker
-
-# 终端 3
-cd frontend
-npm ci
-npm run dev
+CUDA_VISIBLE_DEVICES=0 uv run python -m dynamo.sglang \
+  --model-path Qwen/Qwen3-0.6B \
+  --discovery-backend file
 ```
 
-- 前端：<http://127.0.0.1:5173>
-- 本地 API：<http://127.0.0.1:18080>
-- Docker API：<http://127.0.0.1:8088>
+回到项目根目录：
 
-可以启动多个 Worker；它们共同消费 RabbitMQ 队列，不需要监听不同端口。
+```bash
+cp .env.docker.example .env
+make docker-up
+curl http://127.0.0.1:8088/api/readyz
+```
+
+Docker API 地址：`http://127.0.0.1:8088`。
+
+停止服务：
+
+```bash
+make docker-down
+```
+
+没有 GPU 时，可以将 `.env` 中的 `BACKEND` 改为 `mock`，用于验证网关、队列和数据库流程。
 
 ## API
 
-Docker 模式示例：
+### OpenAI-compatible 推理接口
 
 ```bash
 curl http://127.0.0.1:8088/api/v1/chat/completions \
@@ -174,61 +112,57 @@ curl http://127.0.0.1:8088/api/v1/chat/completions \
 
 流式请求将 `stream` 改为 `true`，并使用 `curl -N`。
 
-| 方法 | 路径 | 作用 |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/healthz` | 基础健康检查 |
+| POST | `/api/v1/chat/completions` | 普通或流式推理 |
+| GET | `/api/healthz` | 健康检查 |
 | GET | `/api/livez` | 存活检查 |
-| GET | `/api/readyz` | Dynamo、RabbitMQ、MySQL 就绪检查 |
+| GET | `/api/readyz` | 依赖就绪检查 |
 | GET | `/api/stats` | Worker Pool 统计 |
 | GET | `/api/metrics` | Prometheus 指标 |
-| GET | `/api/conversations` | 会话列表 |
+| GET | `/api/conversations` | 获取会话列表 |
 | DELETE | `/api/conversations/:id` | 删除会话 |
-| POST | `/api/v1/chat/completions` | OpenAI-compatible 推理接口 |
 
-配置 `AUTH_JWT_SECRET`（至少 32 个字符）后启用用户系统：
+### 用户认证
 
-```bash
-AUTH_JWT_SECRET=$(openssl rand -base64 32)
+配置 `AUTH_JWT_SECRET` 后启用用户系统：
+
+```env
+AUTH_JWT_SECRET=至少32个字符的随机字符串
 ```
 
+接口：
+
 ```text
-POST /api/auth/register   注册并返回 Access/Refresh Token
+POST /api/auth/register   注册
 POST /api/auth/login      登录
-POST /api/auth/refresh    轮换 Refresh Token
-POST /api/auth/logout     注销登录会话
+POST /api/auth/refresh    刷新 Token
+POST /api/auth/logout     注销 Session
 GET  /api/auth/me         获取当前用户
 ```
 
-业务请求使用：
+业务请求携带：
 
 ```text
 Authorization: Bearer <access_token>
 ```
 
-Access Token 默认 15 分钟，Refresh Token 默认 30 天。每个用户可以拥有多个
-登录会话；聊天会话通过 `conversation_id` 归属于登录用户。未配置
-`AUTH_JWT_SECRET` 时，本地兼容使用 `X-Client-ID`，不适合生产环境。
+Access Token 默认有效期 15 分钟，Refresh Token 默认有效期 30 天。未启用用户认证时，
+本地开发可以使用 `X-Client-ID` 隔离匿名会话。
 
-快速验证用户系统：
+## 核心配置
 
-```bash
-curl -s http://127.0.0.1:8088/api/auth/register \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","email":"alice@example.com","password":"password123"}'
-
-curl -s http://127.0.0.1:8088/api/auth/me \
-  -H 'Authorization: Bearer <access_token>'
+```env
+BACKEND=dynamo
+DYNAMO_URL=http://127.0.0.1:8000
+QUEUE_URL=amqp://guest:guest@127.0.0.1:5672/
+MYSQL_DSN=root:root@tcp(127.0.0.1:3306)/go_ai_studio?parseTime=true
+REDIS_URL=redis://127.0.0.1:6379/0
+MAX_IN_FLIGHT=8
+GLOBAL_MAX_IN_FLIGHT=16
 ```
 
-启用 MySQL 用户认证后，同一个 `conversation_id` 同时只允许一个推理任务，
-服务端使用 MySQL 行锁分配 `turn_id`；不同会话仍可并行执行。消息按
-`turn_id` 和 `message_order` 读取，不依赖 HTTP 连接或 RabbitMQ 的投递顺序。
-
-配置 `API_KEY` 后，也可以使用以下请求头进行服务级鉴权：
-
-```text
-Authorization: Bearer <API_KEY>
-```
+Docker 容器内部使用服务名通信：`mysql:3306`、`rabbitmq:5672`、`redis:6379`。
 
 ## 测试与构建
 
@@ -239,18 +173,13 @@ make vet
 make frontend
 make build
 make integration
-docker compose -f middleware/docker-compose.yml config --quiet
 ```
 
-日志位置：
+日志目录：
 
 ```text
-本地：logs/api.log、logs/inference-worker.log
+本地：logs/
 Docker：logs/api-1/、logs/api-2/、logs/worker-1/
 ```
 
-## 当前边界
-
-这是一个学习型生产工程 MVP，已经具备 Docker Compose、RabbitMQ RPC、Worker Pool、
- Dynamo/SGLang、SSE、MySQL 用户/登录会话/聊天会话和基础可观测性。尚未包含 TLS、
-RabbitMQ TTL/DLQ 和正式压测报告，不建议直接暴露到公网。
+当前项目是学习型生产工程 MVP，未包含 TLS、RabbitMQ TTL/DLQ 和正式压测报告，不建议直接暴露到公网。
