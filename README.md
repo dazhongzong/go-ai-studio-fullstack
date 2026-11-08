@@ -2,9 +2,9 @@
 
 基于 Go 的 OpenAI-compatible LLM 推理网关，支持普通推理、SSE 流式响应、多轮会话、用户认证和多实例部署。
 
-## 演示
+## Demo 演示
 
-![Go AI Studio 演示](assets/demo.gif)
+![Go AI Studio Demo](assets/demo.gif)
 
 ## 架构
 
